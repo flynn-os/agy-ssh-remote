@@ -38,7 +38,7 @@ import uuid
 import zipfile
 
 WEB_BUNDLE_PATCH_VERSION = "20261106-ssh-v11"
-BRIDGE_DAEMON_VERSION = "20261107-ssh-v14"
+BRIDGE_DAEMON_VERSION = "20261107-ssh-v15"
 DEFAULT_HTTPS_PORT = 58282
 DEFAULT_HTTP_PORT = 58283
 DEFAULT_BRIDGE_PORT = 58284
@@ -1477,6 +1477,33 @@ def _connect_end_error(code, message):
     return struct.pack(">BI", 0x02, len(body)) + body
 
 
+_GRPC_STATUS = {"unavailable": 14, "unknown": 2}
+
+
+def _is_grpc_web(content_type):
+    ct = (content_type or "").strip().lower()
+    return ct == "application/grpc-web" or ct.startswith(("application/grpc-web+", "application/grpc-web;"))
+
+
+def _stream_end_error(content_type, code, message):
+    """End-of-stream error frame in the request's protocol: gRPC-web trailer (0x80) or Connect (0x02)."""
+    if _is_grpc_web(content_type):
+        from urllib.parse import quote
+
+        text = f"grpc-status: {_GRPC_STATUS.get(code, 2)}\r\ngrpc-message: {quote(message, safe='')}\r\n"
+        body = text.encode("utf-8")
+        return struct.pack(">BI", 0x80, len(body)) + body
+    return _connect_end_error(code, message)
+
+
+def _header_get(headers, name):
+    name = name.lower()
+    for k, v in (headers or {}).items():
+        if k.lower() == name:
+            return v
+    return None
+
+
 class RelayStream:
     def __init__(self, stream_id, path, headers, body):
         self.id = stream_id
@@ -1500,6 +1527,8 @@ class RelayStream:
         self.attaches = 0
         self.conn = None
         self.closed = False
+        self.content_type = _header_get(headers, "content-type") or "application/connect+json"
+        self.grpc_web = _is_grpc_web(self.content_type)
 
     # -- upstream --------------------------------------------------------------------
     def start(self):
@@ -1531,8 +1560,10 @@ class RelayStream:
         try:
             host, port, csrf = _relay_upstream_target()
             headers = {k: v for k, v in self.req_headers.items() if k.lower() not in RELAY_DROP_REQ_HEADERS}
-            headers.setdefault("content-type", "application/connect+json")
-            headers.setdefault("connect-protocol-version", "1")
+            if not _header_get(headers, "content-type"):
+                headers["content-type"] = "application/connect+json"
+            if not self.grpc_web and not _header_get(headers, "connect-protocol-version"):
+                headers["connect-protocol-version"] = "1"
             if csrf:
                 headers["x-codeium-csrf-token"] = csrf
             self.conn = http.client.HTTPConnection(host, port, timeout=None)
@@ -1560,7 +1591,8 @@ class RelayStream:
                 if len(payload) < length:
                     raise IOError("truncated envelope")
                 self._append(hdr + payload)
-                if flags & 0x02:  # Connect end-of-stream envelope
+                # End of stream: gRPC-web trailer frame (0x80) or Connect end-stream envelope (0x02).
+                if flags & (0x80 if self.grpc_web else 0x02):
                     self._finish("upstream-end")
                     return
             self._finish("upstream-eof")
@@ -1571,10 +1603,10 @@ class RelayStream:
             with self.cond:
                 if not self.ready:
                     self.status = 200
-                    self.resp_headers = {"content-type": self.req_headers.get("content-type") or "application/connect+json"}
+                    self.resp_headers = {"content-type": self.content_type}
                     self.ready = True
             # Tell the client the stream is over so the UI re-subscribes (to a new LS if it restarted).
-            self._append(_connect_end_error("unavailable", f"relay upstream lost: {e}"))
+            self._append(_stream_end_error(self.content_type, "unavailable", f"relay upstream lost: {e}"))
             self._finish("upstream-error")
         finally:
             try:

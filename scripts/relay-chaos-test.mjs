@@ -34,8 +34,25 @@ function envelope(obj, flags = 0) {
   return Buffer.concat([hdr, body]);
 }
 
+function grpcTrailer(text) {
+  const body = Buffer.from(text, 'utf8');
+  const hdr = Buffer.alloc(5);
+  hdr[0] = 0x80;
+  hdr.writeUInt32BE(body.length, 1);
+  return Buffer.concat([hdr, body]);
+}
+
+function parseGrpcTrailer(buf) {
+  const out = {};
+  for (const line of buf.toString('utf8').split('\r\n')) {
+    const i = line.indexOf(':');
+    if (i > 0) out[line.slice(0, i).trim().toLowerCase()] = decodeURIComponent(line.slice(i + 1).trim());
+  }
+  return out;
+}
+
 // ---- fake language_server ------------------------------------------------------------------
-function startFakeLs({updates, tickMs, snapshotBytes, updatePadBytes = 0}) {
+function startFakeLs({updates, tickMs, snapshotBytes, updatePadBytes = 0, grpcWeb = false}) {
   const st = {subscriptions: 0, closedEarly: 0};
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST' || req.url !== METHOD_PATH) {
@@ -45,7 +62,7 @@ function startFakeLs({updates, tickMs, snapshotBytes, updatePadBytes = 0}) {
     req.resume();
     req.on('end', () => {
       st.subscriptions += 1;
-      res.writeHead(200, {'content-type': 'application/connect+json'});
+      res.writeHead(200, {'content-type': grpcWeb ? 'application/grpc-web+json' : 'application/connect+json'});
       res.write(envelope({update: {snapshot: true, pad: 'S'.repeat(snapshotBytes)}}));
       let n = 0;
       let finished = false;
@@ -55,7 +72,7 @@ function startFakeLs({updates, tickMs, snapshotBytes, updatePadBytes = 0}) {
         if (n >= updates) {
           clearInterval(timer);
           finished = true;
-          res.end(envelope({}, 0x02));
+          res.end(grpcWeb ? grpcTrailer('grpc-status: 0\r\n') : envelope({}, 0x02));
         }
       }, tickMs);
       res.on('close', () => {
@@ -203,8 +220,17 @@ function makeSink() {
         const len = st.buf.readUInt32BE(1);
         if (st.buf.length < 5 + len) break;
         const flags = st.buf[0];
-        const json = JSON.parse(st.buf.subarray(5, 5 + len).toString('utf8') || '{}');
+        const payload = st.buf.subarray(5, 5 + len);
         st.buf = st.buf.subarray(5 + len);
+        if (st.endFrame) st.afterEnd = (st.afterEnd || 0) + 1;
+        if (flags & 0x80) {
+          // gRPC-web trailer. Normalize to the Connect shape the checks use.
+          const t = parseGrpcTrailer(payload);
+          st.trailer = t;
+          st.endFrame = t['grpc-status'] === '0' ? {} : {error: {code: t['grpc-status'] === '14' ? 'unavailable' : `grpc-${t['grpc-status']}`, message: t['grpc-message']}};
+          continue;
+        }
+        const json = JSON.parse(payload.toString('utf8') || '{}');
         if (flags & 0x02) st.endFrame = json;
         else st.frames.push(json);
       }
@@ -228,6 +254,7 @@ function checkComplete(sink, updates) {
   }
   if (!sink.st.ended) errs.push('stream not ended');
   if (!sink.st.endFrame || sink.st.endFrame.error) errs.push(`bad end frame ${JSON.stringify(sink.st.endFrame)}`);
+  if (sink.st.afterEnd) errs.push(`${sink.st.afterEnd} frame(s) after the end frame`);
   return errs;
 }
 
@@ -249,7 +276,13 @@ async function withRig(opts, fn) {
   const logs = [];
   const client = new ResumableRelayStream({
     getBridge: () => ({host: '127.0.0.1', port: proxy.port}),
-    request: {path: METHOD_PATH, headers: {'content-type': 'application/connect+json', 'connect-protocol-version': '1'}, body: envelope({conversationId: 'test'})},
+    request: {
+      path: METHOD_PATH,
+      headers: opts.ls.grpcWeb
+        ? {'content-type': 'application/grpc-web+json', 'x-grpc-web': '1'}
+        : {'content-type': 'application/connect+json', 'connect-protocol-version': '1'},
+      body: envelope({conversationId: 'test'}),
+    },
     sink,
     log: (m) => logs.push(m),
     stallMs: 3000,
@@ -352,6 +385,51 @@ const SCENARIOS = {
       const errs = [];
       if (r.sink.st.endFrame?.error?.code !== 'unavailable') errs.push(`want unavailable end frame, got ${JSON.stringify(r.sink.st.endFrame)}`);
       return {errs, info: {end: r.sink.st.endFrame}};
+    });
+  },
+
+  // The real UI uses gRPC-web (application/grpc-web+json): the end of stream is a 0x80 trailer
+  // frame. Drops must still deliver everything once, and the bridge must see the trailer as the end.
+  async grpcWebDrops() {
+    const updates = 80;
+    return withRig({ls: {updates, tickMs: 40, snapshotBytes: 200000, grpcWeb: true}, proxy: {bytesPerSec: 1_500_000}}, async (r) => {
+      await sleep(150);
+      r.proxy.drop();
+      await sleep(1500);
+      r.proxy.drop();
+      await waitFor(() => r.sink.st.ended, 20000);
+      const errs = checkComplete(r.sink, updates);
+      if (r.ls.st.subscriptions !== 1) errs.push(`LS subscriptions=${r.ls.st.subscriptions} (want 1)`);
+      if (r.sink.st.trailer?.['grpc-status'] !== '0') errs.push(`want grpc-status 0 trailer, got ${JSON.stringify(r.sink.st.trailer)}`);
+      if (!/grpc-web/.test(r.sink.st.headers?.['content-type'] || '')) errs.push(`content-type ${r.sink.st.headers?.['content-type']}`);
+      return {errs, info: {resumes: r.client.stats.resumes, trailer: r.sink.st.trailer}};
+    });
+  },
+
+  // gRPC-web stream whose bridge restarts: the client must end it with a gRPC-web trailer
+  // (grpc-status 14), not a Connect envelope, or the UI reports "missing trailer".
+  async grpcWebBridgeRestart() {
+    return withRig({ls: {updates: 200, tickMs: 30, snapshotBytes: 1000, grpcWeb: true}}, async (r) => {
+      await sleep(800);
+      await r.restartBridge();
+      await waitFor(() => r.sink.st.ended, 10000);
+      const errs = [];
+      if (r.sink.st.trailer?.['grpc-status'] !== '14') errs.push(`want grpc-status 14 trailer, got ${JSON.stringify(r.sink.st.trailer)}`);
+      if (r.sink.st.frames.some((f) => f.error)) errs.push('Connect error envelope delivered as a gRPC-web message');
+      return {errs, info: {trailer: r.sink.st.trailer}};
+    });
+  },
+
+  // gRPC-web stream whose LS dies mid-stream: the bridge synthesizes a grpc-status 14 trailer.
+  async grpcWebUpstreamLost() {
+    return withRig({ls: {updates: 1000, tickMs: 30, snapshotBytes: 1000, grpcWeb: true}}, async (r) => {
+      await sleep(800);
+      r.ls.server.closeAllConnections();
+      await waitFor(() => r.sink.st.ended, 10000);
+      const errs = [];
+      if (r.sink.st.trailer?.['grpc-status'] !== '14') errs.push(`want grpc-status 14 trailer, got ${JSON.stringify(r.sink.st.trailer)}`);
+      if (r.sink.st.afterEnd) errs.push(`${r.sink.st.afterEnd} frame(s) after the trailer`);
+      return {errs, info: {trailer: r.sink.st.trailer}};
     });
   },
 

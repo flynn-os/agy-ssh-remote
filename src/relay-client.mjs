@@ -62,6 +62,32 @@ export function connectEndStreamError(message, code = 'unavailable') {
   return Buffer.concat([hdr, body]);
 }
 
+const GRPC_STATUS = {unavailable: 14, unknown: 2};
+
+export function isGrpcWeb(contentType) {
+  return /^application\/grpc-web(\+|;|$)/i.test(String(contentType || '').trim());
+}
+
+/** gRPC-web trailer frame (flag 0x80) carrying a grpc-status error. */
+export function grpcWebEndStreamError(message, code = 'unavailable') {
+  const text = `grpc-status: ${GRPC_STATUS[code] ?? 2}\r\ngrpc-message: ${encodeURIComponent(message)}\r\n`;
+  const body = Buffer.from(text, 'utf8');
+  const hdr = Buffer.alloc(5);
+  hdr[0] = 0x80;
+  hdr.writeUInt32BE(body.length, 1);
+  return Buffer.concat([hdr, body]);
+}
+
+/** End-of-stream error frame in the request's own protocol (Connect or gRPC-web). */
+export function endStreamError(contentType, message, code = 'unavailable') {
+  return isGrpcWeb(contentType) ? grpcWebEndStreamError(message, code) : connectEndStreamError(message, code);
+}
+
+export function requestContentType(headers) {
+  for (const [k, v] of Object.entries(headers || {})) if (k.toLowerCase() === 'content-type') return String(v);
+  return '';
+}
+
 function parseJson(buf) {
   try {
     return JSON.parse(buf.toString('utf8'));
@@ -343,7 +369,7 @@ export class ResumableRelayStream {
       this.sink.writeHead(502, {'content-type': 'text/plain'});
       this.sink.write(Buffer.from(`relay unavailable: ${reason}`));
     } else {
-      this.sink.write(connectEndStreamError(reason));
+      this.sink.write(endStreamError(requestContentType(this.request.headers), reason));
     }
     this.sink.end();
     this.closeRemote();

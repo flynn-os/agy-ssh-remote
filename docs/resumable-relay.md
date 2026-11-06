@@ -60,7 +60,14 @@ The relay lives in the existing bridge daemon, not in a new process, because tha
 - is forwarded over the same ssh connection (port 58284);
 - is version-gated by `BRIDGE_DAEMON_VERSION`.
 
-The relay uses only the Python stdlib. Python has no HTTP/2 client in the stdlib, but the LS's plain-HTTP port speaks the Connect protocol over HTTP/1.1 with chunked responses. Connect server-streaming works over HTTP/1.1. The UI uses the Connect transport with JSON (`application/connect+json`), so each envelope is self-delimiting and the relay never decodes messages.
+The relay uses only the Python stdlib. Python has no HTTP/2 client in the stdlib, but the LS's plain-HTTP port serves server-streaming RPCs over HTTP/1.1 with chunked responses. The UI's LS client uses the gRPC-web transport with JSON (`application/grpc-web+json`); Connect (`application/connect+json`) works too. Both use the same 5-byte envelope, so each frame is self-delimiting and the relay never decodes messages. The two protocols differ only in the end-of-stream frame:
+
+| protocol | end-of-stream frame | error the relay synthesizes |
+|---|---|---|
+| gRPC-web | flag `0x80`, trailer text `grpc-status: N` | `grpc-status: 14` (unavailable) |
+| Connect | flag `0x02`, JSON `{error?}` | `{"error":{"code":"unavailable"}}` |
+
+Both sides pick the frame from the request's `content-type`. `application/grpc-web-text` (base64 framing) is not relayed; it goes over H2 as before.
 
 ### Wire protocol (bridge → Mac)
 
@@ -77,7 +84,7 @@ The response is a sequence of records until the connection closes. Each record i
 | type | seq | payload |
 |---|---|---|
 | 1 META | 0 | `{streamId, status, headers, oldestSeq, lastSeq, resumed}`, the upstream response head |
-| 2 FRAME | 1, 2, … | one raw Connect envelope, including its 5-byte header (end-stream envelope too) |
+| 2 FRAME | 1, 2, … | one raw envelope, including its 5-byte header (the end-of-stream frame too) |
 | 3 END | last | `{reason}`: `upstream-end`, `upstream-error`, `closed`, or `gap` (afterSeq was evicted) |
 | 4 BEAT | lastSeq | heartbeat every 5 s while idle |
 
@@ -89,7 +96,7 @@ Other endpoints:
 
 ### Remote side (`RelayStream` in `remote/remote-ctl.py`)
 
-- **Pump thread.** It reads envelopes from the LS response, appends `(seq, bytes)`, and evicts the oldest entries above the byte cap while always keeping the newest. It stops at an end-stream envelope. If the upstream errors, it appends a synthesized Connect `unavailable` end-stream envelope, so the UI re-subscribes, for example to a restarted LS.
+- **Pump thread.** It reads envelopes from the LS response, appends `(seq, bytes)`, and evicts the oldest entries above the byte cap while always keeping the newest. It stops at the end-of-stream frame. If the upstream errors, it appends a synthesized `unavailable` end-of-stream frame in the request's protocol, so the UI re-subscribes, for example to a restarted LS.
 - **Writer.** One writer runs per attach, in a handler thread. It sends META, replays frames with `seq > afterSeq`, then follows live frames, sending heartbeats while idle. Each attach bumps `attach_gen`, so the previous writer exits on its next wakeup. This makes a new attach safe while the old socket is still half-alive.
 - **Janitor.** It reaps a stream after it has been detached for `RELAY_RETENTION_S`, then closes the LS subscription. At most 64 streams are kept; past that, the longest-detached stream is evicted first.
 
@@ -99,7 +106,7 @@ Other endpoints:
 - **Ordering.** Frames with `seq <= lastSeq` are dropped as duplicates; this happens during overlapping attaches. A frame with `seq > lastSeq + 1` is a gap, and the client gives up.
 - **Reconnect.** When the connection ends or errors, the client retries with exponential backoff and jitter: 250 ms, doubling, capped at 5 s. While the tunnel is down (`sshState.status !== 'connected'`), it does not dial at all. It retries immediately when `ensureRemoteTunnel` reports connected again (`notifyRelayReconnected`).
 - **Stall: make-before-break at the stream level.** A stall is no bytes for 20 s; heartbeats arrive every 5 s. This catches a hung ssh whose socket never closes. The client starts a parallel attach and keeps the stalled one until the new attach delivers META, then drops the old one. The bridge has already preempted the old writer by then.
-- **Giving up.** The client gives up when it cannot resume within 150 s, gets `404`, or gets a `gap`. It then writes a Connect end-stream error `{"error":{"code":"unavailable"}}` and ends the browser stream. The UI then does exactly what it did before: it resets and re-subscribes. So the worst case equals today's behavior, and frames are never silently skipped.
+- **Giving up.** The client gives up when it cannot resume within 150 s, gets `404`, or gets a `gap`. It then writes an `unavailable` end-of-stream frame in the request's protocol (a `grpc-status: 14` trailer for the UI) and ends the browser stream. The UI then does exactly what it did before: it resets and re-subscribes. So the worst case equals today's behavior, and frames are never silently skipped.
 - **Browser close.** `cancel()` drops the Mac side and calls `/relay/close`.
 
 ### Tunnel-level make-before-break (not done yet)
@@ -156,6 +163,8 @@ It wires together a fake LS, the real `remote-ctl.py` relay, a TCP chaos proxy a
 | `longOutage` | 8 s down while frames keep coming; replay. |
 | `gap` | A buffer overflow. Expects a clean `unavailable`, with no skipped frames. |
 | `bridgeRestart` | `404`, then a clean `unavailable`. |
+| `grpcWebDrops` | The UI's real protocol: drops, then a normal `grpc-status: 0` trailer, with one LS subscription. |
+| `grpcWebBridgeRestart`, `grpcWebUpstreamLost` | Failures end with a `grpc-status: 14` trailer, not a Connect envelope. Before this fix the UI reported `missing trailer`. |
 | `cancel` | The LS subscription is released. |
 
 **Live ssh kill test.** This uses the real LS over a real route, and leaves the running setup untouched. It starts its own relay-only bridge on remote port 58294 and its own `ssh -L`:

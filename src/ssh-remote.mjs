@@ -40,7 +40,7 @@ const LOCAL_WWW_CACHE_DIR = path.join(CACHE_DIR, 'www');
 const LOCAL_WWW_META_PATH = path.join(CACHE_DIR, 'www-meta.json');
 const LOCAL_DELETED_TOMBSTONES_PATH = path.join(CACHE_DIR, 'deleted-conversations.json');
 const LOCAL_WWW_PATCH_VERSION = '20261103-ssh-v10';
-const EXPECTED_BRIDGE_VERSION = '20261107-ssh-v14';
+const EXPECTED_BRIDGE_VERSION = '20261107-ssh-v15';
 const LOCAL_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
 const LOCAL_CLI_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'conversations');
 const APP_INFO_PLIST_PATH = '/Applications/Antigravity.app/Contents/Info.plist';
@@ -3726,7 +3726,8 @@ function ensureLocalHttpsProxy() {
               outHeaders['x-codeium-csrf-token'] = targetCsrf;
             }
 
-            if (target === 'remote' && shouldRelayStream(methodName)) {
+            // grpc-web-text is base64 framed; the relay only handles binary-framed Connect / gRPC-web.
+            if (target === 'remote' && shouldRelayStream(methodName) && !/grpc-web-text/i.test(String(outHeaders['content-type'] || ''))) {
               startRelayedStream(req, res, reqPath, outHeaders, forwardBody, parsedJson);
               return;
             }
