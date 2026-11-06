@@ -13,6 +13,10 @@
     "status": "node ./src/patchctl.mjs status",
     "ssh:status": "node ./src/patchctl.mjs ssh status",
     "ssh:restart": "node ./src/patchctl.mjs ssh restart",
-    "restart": "launchctl kickstart -k gui/$(id -u)/local.fei.antigravity-theme"
+    "restart": "launchctl kickstart -k gui/$(id -u)/local.fei.antigravity-theme",
+    "test:relay": "node ./scripts/relay-chaos-test.mjs",
+    "test:relay-live": "node ./scripts/relay-ssh-kill-test.mjs",
+    "check": "for f in src/*.mjs scripts/*.mjs ui/inject.js; do node --check \"$f\" || exit 1; done && python3 -m py_compile remote/remote-ctl.py",
+    "test": "npm run check && node --test tests/*.test.mjs && node ./scripts/relay-chaos-test.mjs"
   }
 }
