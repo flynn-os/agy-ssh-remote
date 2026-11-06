@@ -38,7 +38,7 @@ const LOCAL_WWW_CACHE_DIR = path.join(CACHE_DIR, 'www');
 const LOCAL_WWW_META_PATH = path.join(CACHE_DIR, 'www-meta.json');
 const LOCAL_DELETED_TOMBSTONES_PATH = path.join(CACHE_DIR, 'deleted-conversations.json');
 const LOCAL_WWW_PATCH_VERSION = '20261103-ssh-v10';
-const EXPECTED_BRIDGE_VERSION = '20261106-ssh-v11';
+const EXPECTED_BRIDGE_VERSION = '20261107-ssh-v13';
 const LOCAL_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
 const LOCAL_CLI_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'conversations');
 const APP_INFO_PLIST_PATH = '/Applications/Antigravity.app/Contents/Info.plist';
@@ -101,12 +101,28 @@ try {
   fs.mkdirSync(SSH_CONTROL_DIR, {recursive: true, mode: 0o700});
 } catch {}
 
-const SSH_BASE_ARGS = [
+const SSH_COMMON_ARGS = [
   '-o', 'BatchMode=yes',
   '-o', 'StrictHostKeyChecking=accept-new',
+  '-o', 'ExitOnForwardFailure=yes',
+];
+
+// Short-lived exec / probe calls: fail fast.
+const SSH_BASE_ARGS = [
+  ...SSH_COMMON_ARGS,
   '-o', 'ServerAliveInterval=5',
   '-o', 'ServerAliveCountMax=2',
-  '-o', 'ExitOnForwardFailure=yes',
+];
+
+// Long-lived port-forward tunnel: tolerate transient stalls on relayed / lossy links.
+// The old 5s x 2 budget tore the tunnel (and every live stream) down after a 10s hiccup,
+// which on a cross-border relay is routine. 15s x 4 = 60s before ssh gives up; the app-level
+// health check below detects real outages and decides when to reconnect.
+const SSH_TUNNEL_ARGS = [
+  ...SSH_COMMON_ARGS,
+  '-o', 'ServerAliveInterval=15',
+  '-o', 'ServerAliveCountMax=4',
+  '-o', 'TCPKeepAlive=no',
 ];
 
 const SSH_MUX_ARGS = [
@@ -3866,7 +3882,7 @@ function handleOpenUrls(urls, host) {
 export async function ensureSidecarTunnel(host, port) {
   if (!host || !port || sidecarTunnels.has(port)) return;
   const args = [
-    ...SSH_BASE_ARGS,
+    ...SSH_TUNNEL_ARGS,
     '-N',
     '-L', `127.0.0.1:${port}:127.0.0.1:${port}`,
     host,
@@ -4440,7 +4456,7 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
           if (isStale()) return {ok: false, error: 'Superseded by newer connection request'};
 
           const forwardArgs = [
-            ...SSH_BASE_ARGS,
+            ...SSH_TUNNEL_ARGS,
             '-N',
             '-L', `127.0.0.1:${tHttps}:127.0.0.1:${rHttps}`,
             '-L', `127.0.0.1:${lHttp}:127.0.0.1:${rHttp}`,
@@ -4559,6 +4575,10 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
       if (isStale()) return getSshState();
       const {host, remoteInfo, pingRtt, rHttps, rHttp, rBridge, tHttps, lHttp, lBridge} = established;
       consecutivePingFailures = 0;
+      if (host !== sshState.activeHost) lastRouteSwitchTs = Date.now();
+      rttEwmaMs = 0;
+      noteRtt(pingRtt);
+      logSsh(`SSH tunnel up via ${host} (rtt=${pingRtt}ms)`);
       sshState.csrfToken = remoteInfo.csrfToken || sshState.csrfToken;
       if (pingRtt > 0) sshState.routeLatencies[host] = pingRtt;
       handleOpenUrls(remoteInfo.openUrls, host);
@@ -4596,6 +4616,7 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
       return getSshState();
     } catch (err) {
       if (isStale()) return getSshState();
+      logSsh(`SSH tunnel connect failed (mode=${targetMode}): ${err.message || err}`);
       return emitState({
         mode: targetMode,
         status: 'error',
@@ -4612,7 +4633,57 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
   return connectingPromise;
 }
 
+// ---- Link health -------------------------------------------------------------------
+// Reconnecting is expensive: every upstream H2 stream (conversation updates, summaries,
+// project watchers) dies with the tunnel and the UI has to re-fetch history. So we only
+// tear the tunnel down when the link is really gone, not when one ping was slow because a
+// large response was in flight.
+let healthPollInFlight = false;
+let rttEwmaMs = 0;
+let lastHealthyTs = 0;
+let directGoodStreak = 0;
+let lastRouteSwitchTs = 0;
+let sshLogger = null;
+const HEALTH_FAIL_BUDGET = 3;           // consecutive failed polls ...
+const HEALTH_FAIL_MIN_WINDOW_MS = 30000; // ... spanning at least this long
+const ROUTE_SWITCH_MIN_INTERVAL_MS = 120000;
+const DIRECT_GOOD_STREAK_REQUIRED = 3;
+
+export function setSshLogger(fn) {
+  sshLogger = typeof fn === 'function' ? fn : null;
+}
+
+function logSsh(message) {
+  try { sshLogger?.(message); } catch {}
+}
+
+function noteRtt(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  rttEwmaMs = rttEwmaMs ? Math.round(rttEwmaMs * 0.7 + ms * 0.3) : ms;
+  lastHealthyTs = Date.now();
+}
+
+// Timeout that scales with the observed RTT so a 400ms relay link gets more slack than LAN.
+function adaptiveTimeout(baseMs, maxMs = 15000) {
+  return Math.min(maxMs, Math.max(baseMs, rttEwmaMs * 8));
+}
+
+function reconnectTunnel(reason) {
+  logSsh(`Reconnecting SSH tunnel (mode=${sshState.mode}, host=${mainTunnelHost || sshState.activeHost || '-'}): ${reason}`);
+  return ensureRemoteTunnel(sshState.mode, {forceReconnect: true});
+}
+
 export async function pollTunnelHealth() {
+  if (healthPollInFlight) return getSshState();
+  healthPollInFlight = true;
+  try {
+    return await pollTunnelHealthOnce();
+  } finally {
+    healthPollInFlight = false;
+  }
+}
+
+async function pollTunnelHealthOnce() {
   ensureLocalPatchedMainJs();
   await discoverLocalMacLsPort();
   syncCliSummariesAndPushUpdates().catch(() => {});
@@ -4621,18 +4692,20 @@ export async function pollTunnelHealth() {
 
   if (!mainTunnelProc || mainTunnelProc.exitCode !== null || sshState.status !== 'connected') {
     consecutivePingFailures += 1;
-    return ensureRemoteTunnel(sshState.mode, {forceReconnect: true});
+    const why = !mainTunnelProc
+      ? 'no tunnel process'
+      : mainTunnelProc.exitCode !== null
+        ? `ssh exited (${mainTunnelProc.exitCode})`
+        : `status=${sshState.status}`;
+    return reconnectTunnel(why);
   }
 
-  const ping = await pingBridge(sshState.localBridgePort, 4000);
+  const ping = await pingBridge(sshState.localBridgePort, adaptiveTimeout(4000));
   if (ping.ok) {
     consecutivePingFailures = 0;
+    noteRtt(ping.latencyMs);
     if (mainTunnelHost) sshState.routeLatencies[mainTunnelHost] = ping.latencyMs;
-    let st = await fetchBridgeStatus(sshState.localBridgePort, 4000);
-    if (!st) {
-      await new Promise((r) => setTimeout(r, 200));
-      st = await fetchBridgeStatus(sshState.localBridgePort, 3000);
-    }
+    const st = await fetchBridgeStatus(sshState.localBridgePort, adaptiveTimeout(4000));
     if (st?.openUrls?.length) handleOpenUrls(st.openUrls, mainTunnelHost || sshState.activeHost || 'fei');
     const desiredAppVersion = detectLocalAppVersion();
     if (
@@ -4641,17 +4714,34 @@ export async function pollTunnelHealth() {
         (st.version && st.version !== desiredAppVersion) ||
         (st.bridgeVersion && st.bridgeVersion !== EXPECTED_BRIDGE_VERSION))
     ) {
-      return ensureRemoteTunnel(sshState.mode, {forceReconnect: true});
+      return reconnectTunnel(
+        st.running === false
+          ? 'remote language_server not running'
+          : `remote version mismatch (ls=${st.version}, bridge=${st.bridgeVersion})`
+      );
     }
 
-    // If in auto mode and currently on fallback fei-tunnel, check if direct 'fei' route is back online
+    // Auto mode on the relay: only move back to the direct route after it has been
+    // consistently good for a while, and never more than once per ROUTE_SWITCH_MIN_INTERVAL_MS.
+    // Each switch drops every live stream, so flapping is worse than staying on the relay.
     if (sshState.mode === 'auto' && mainTunnelHost === 'fei-tunnel') {
       probeHostRtt('fei', 2000).then((pFei) => {
         sshState.routeLatencies.fei = pFei.ok ? pFei.latencyMs : null;
-        if (pFei.ok && pFei.latencyMs <= 500 && !connectingPromise && sshState.mode === 'auto' && mainTunnelHost === 'fei-tunnel') {
-          ensureRemoteTunnel('auto', {forceReconnect: true}).catch(() => {});
+        directGoodStreak = pFei.ok && pFei.latencyMs <= 500 ? directGoodStreak + 1 : 0;
+        if (
+          directGoodStreak >= DIRECT_GOOD_STREAK_REQUIRED &&
+          Date.now() - lastRouteSwitchTs >= ROUTE_SWITCH_MIN_INTERVAL_MS &&
+          !connectingPromise &&
+          sshState.mode === 'auto' &&
+          mainTunnelHost === 'fei-tunnel'
+        ) {
+          directGoodStreak = 0;
+          lastRouteSwitchTs = Date.now();
+          reconnectTunnel(`direct route healthy again (${pFei.latencyMs}ms), leaving relay`).catch(() => {});
         }
       }).catch(() => {});
+    } else {
+      directGoodStreak = 0;
     }
 
     if (Object.keys(sshState.projectEnvMap).length === 0 || sshState.remoteProjectIds.length === 0) {
@@ -4668,22 +4758,25 @@ export async function pollTunnelHealth() {
     });
   }
 
-  await new Promise((r) => setTimeout(r, 250));
-  const retryPing = await pingBridge(sshState.localBridgePort, 2500);
-  if (retryPing.ok) {
-    consecutivePingFailures = 0;
-    return getSshState();
-  }
-
   consecutivePingFailures += 1;
-  if (consecutivePingFailures < 2 && mainTunnelProc && mainTunnelProc.exitCode === null) {
+  const sinceHealthy = lastHealthyTs ? Date.now() - lastHealthyTs : Infinity;
+  // ssh itself is still alive (its own keepalive hasn't given up), so a missed ping most
+  // likely means the link is congested, not dead. Keep the tunnel and its streams.
+  if (
+    mainTunnelProc &&
+    mainTunnelProc.exitCode === null &&
+    (consecutivePingFailures < HEALTH_FAIL_BUDGET || sinceHealthy < HEALTH_FAIL_MIN_WINDOW_MS)
+  ) {
     return getSshState();
   }
-  return ensureRemoteTunnel(sshState.mode, {forceReconnect: true});
+  return reconnectTunnel(`bridge unreachable for ${consecutivePingFailures} polls (${Math.round(sinceHealthy / 1000)}s)`);
 }
 
 export async function fetchRemoteConversationRaw(cascadeId, lastSig = '', afterIdx = -1) {
   if (!cascadeId || sshState.status !== 'connected') return null;
   const pathStr = `/metrics?cascadeId=${encodeURIComponent(cascadeId)}&sig=${encodeURIComponent(lastSig || '')}&afterIdx=${encodeURIComponent(String(afterIdx))}`;
-  return fetchBridgeJson(pathStr, 3000);
+  // A full (non-delta) fetch can be MBs; give it time to finish once instead of aborting
+  // at 3s and re-downloading it on every poll.
+  const isFull = !(afterIdx >= 0);
+  return fetchBridgeJson(pathStr, isFull ? adaptiveTimeout(20000, 45000) : adaptiveTimeout(5000));
 }

@@ -18,6 +18,7 @@ import {
   pushMergedProjectListToBrowsers,
   discoverLocalMacLsPort,
   stopAllTunnels,
+  setSshLogger,
 } from './ssh-remote.mjs';
 
 const PATCH_VERSION = '20261104-ssh-v12';
@@ -242,13 +243,25 @@ function readLocalConversationMetrics(cascadeId) {
   }
 }
 
+// Per-conversation backoff for remote metrics. The first fetch of a long conversation is
+// several MB; on a slow relay it used to time out after 3s and be retried every 1.2s, so the
+// metrics pill alone could saturate the tunnel and starve the real history/stream traffic.
+const remoteMetricsBackoff = new Map(); // cascadeId -> { until, fails }
+
 async function readRemoteConversationMetrics(cascadeId) {
   if (!cascadeId || !/^[0-9a-f-]{36}$/i.test(cascadeId)) return null;
   const cached = remoteMetricsCache.get(cascadeId);
+  const backoff = remoteMetricsBackoff.get(cascadeId);
+  if (backoff && Date.now() < backoff.until) return cached?.payload || null;
   const prevParsedMap = cached?.parsedMap ? new Map(cached.parsedMap) : new Map();
   const maxPrevIdx = prevParsedMap.size > 1 ? Math.max(...prevParsedMap.keys()) - 1 : -1;
   const raw = await fetchRemoteConversationRaw(cascadeId, cached?.sig || '', maxPrevIdx);
-  if (!raw || raw.ok === false) return cached?.payload || null;
+  if (!raw || raw.ok === false) {
+    const fails = (backoff?.fails || 0) + 1;
+    remoteMetricsBackoff.set(cascadeId, {fails, until: Date.now() + Math.min(60000, 2000 * 2 ** (fails - 1))});
+    return cached?.payload || null;
+  }
+  remoteMetricsBackoff.delete(cascadeId);
   if (!raw.hasData) return {cascadeId, hasData: false, sig: raw.sig || ''};
   if (raw.unchanged && cached) return cached.payload;
   const nextParsedMap = raw.delta ? prevParsedMap : new Map();
@@ -323,8 +336,18 @@ async function pushMetricsToSession(session, cascadeId, force = false) {
   } catch {}
 }
 
+let metricsSyncInFlight = false;
 async function syncAllMetrics() {
-  if (stopping) return;
+  if (stopping || metricsSyncInFlight) return;
+  metricsSyncInFlight = true;
+  try {
+    await syncAllMetricsOnce();
+  } finally {
+    metricsSyncInFlight = false;
+  }
+}
+
+async function syncAllMetricsOnce() {
   for (const session of sessions.values()) {
     if (!session.client.open) continue;
     try {
@@ -683,6 +706,7 @@ async function stop() {
   await log('Stopped; runtime changes removed');
   process.exit(0);
 }
+setSshLogger(message => { log(message).catch(() => {}); });
 process.on('SIGTERM', stop);
 process.on('SIGINT', stop);
 startLocalMetricsFsWatcher();

@@ -35,7 +35,7 @@ import urllib.request
 import zipfile
 
 WEB_BUNDLE_PATCH_VERSION = "20261106-ssh-v11"
-BRIDGE_DAEMON_VERSION = "20261106-ssh-v11"
+BRIDGE_DAEMON_VERSION = "20261107-ssh-v13"
 DEFAULT_HTTPS_PORT = 58282
 DEFAULT_HTTP_PORT = 58283
 DEFAULT_BRIDGE_PORT = 58284
@@ -1254,7 +1254,8 @@ def read_conversation_raw(cascade_id, client_sig="", after_idx=-1):
             rows_map = dict(prev_rows_map)
             for r in cur.fetchall():
                 b64_str = base64.b64encode(r[1]).decode("ascii")
-                rows_map[int(r[0])] = {"idx": int(r[0]), "data": b64_str, "b64": b64_str}
+                # Single copy: the Mac side reads r.data ?? r.b64. Sending both doubled the payload.
+                rows_map[int(r[0])] = {"idx": int(r[0]), "data": b64_str}
             if not rows_map:
                 conn.close()
                 return {"ok": True, "cascadeId": cascade_id, "hasData": False, "sig": sig}
