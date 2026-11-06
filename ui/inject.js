@@ -358,10 +358,18 @@
   window.__ag_sync_active_env = syncActiveEnvFromUrl;
   syncActiveEnvFromUrl();
 
-  const wslDistroLabels = {
-    auto: 'auto (智能双路: fei 优先 → fei-tunnel 保底)',
-    fei: 'fei (直连/Tailscale · 同网段极速)',
-    'fei-tunnel': 'fei-tunnel (VPS 反代隧道 · 跨网段稳定)',
+  // Route modes are roles; the actual ssh host aliases come from the daemon (sshState.routeHosts).
+  const routeHostLabel = role => sshState.routeHosts?.[role] ? ` · ${sshState.routeHosts[role]}` : '';
+  const wslDistroLabelFor = mode => {
+    if (mode === 'direct') return `direct${routeHostLabel('direct')} (直连 · 低延迟)`;
+    if (mode === 'tunnel') return `tunnel${routeHostLabel('tunnel')} (跳板隧道 · 跨网段稳定)`;
+    return 'auto (智能双路: 直连优先 → 隧道保底)';
+  };
+  const parseDistroMode = raw => {
+    const v = String(raw || 'auto');
+    if (v.startsWith('tunnel')) return 'tunnel';
+    if (v.startsWith('direct')) return 'direct';
+    return 'auto';
   };
 
   function installRemoteShims() {
@@ -393,20 +401,20 @@
 
     const getActiveWslDistroLabel = () => {
       if (sshState.status !== 'connected' && !isRemoteWindow()) return null;
-      return wslDistroLabels[sshState.mode] || wslDistroLabels.auto;
+      return wslDistroLabelFor(sshState.mode);
     };
 
     const buildWslState = async () => ({
       available: true,
       activeDistro: getActiveWslDistroLabel(),
       distros: [
-        {name: wslDistroLabels.auto, isDefault: sshState.mode === 'auto'},
-        {name: wslDistroLabels.fei, isDefault: sshState.mode === 'fei'},
-        {name: wslDistroLabels['fei-tunnel'], isDefault: sshState.mode === 'fei-tunnel'},
+        {name: wslDistroLabelFor('auto'), isDefault: sshState.mode === 'auto'},
+        {name: wslDistroLabelFor('direct'), isDefault: sshState.mode === 'direct'},
+        {name: wslDistroLabelFor('tunnel'), isDefault: sshState.mode === 'tunnel'},
       ],
       config: {
         enabled: sshState.status === 'connected' || isRemoteWindow(),
-        distro: wslDistroLabels[sshState.mode] || wslDistroLabels.auto,
+        distro: wslDistroLabelFor(sshState.mode),
       },
     });
 
@@ -418,8 +426,7 @@
         distro: sshState.mode === 'local' ? 'auto' : sshState.mode,
       }),
       setConfig: async cfg => {
-        const rawDistro = String(cfg?.distro || 'auto');
-        const parsedMode = rawDistro.startsWith('fei-tunnel') ? 'fei-tunnel' : (rawDistro.startsWith('fei') ? 'fei' : 'auto');
+        const parsedMode = parseDistroMode(cfg?.distro);
         if (cfg?.enabled) {
           sendSshAction({action: 'set-mode', mode: parsedMode});
         } else {
@@ -434,8 +441,7 @@
           sendSshAction({action: 'set-mode', mode: 'local'});
           return {success: true, mode: 'local'};
         }
-        const rawDistro = String(distro);
-        const parsedMode = rawDistro.startsWith('fei-tunnel') ? 'fei-tunnel' : (rawDistro.startsWith('fei') ? 'fei' : 'auto');
+        const parsedMode = parseDistroMode(distro);
         sendSshAction({action: 'set-mode', mode: parsedMode});
         return {success: true, mode: parsedMode, port: sshState.localHttpsPort || 58282, csrfToken: sshState.csrfToken || ''};
       },
@@ -1362,9 +1368,9 @@
         '<div class="ag-ssh-route-row">',
         '  <span class="ag-ssh-route-lbl">线路</span>',
         '  <select id="ag-ssh-mode-select" aria-label="SSH 远程线路模式">',
-        '    <option value="auto">⚡ 智能双路 (fei → tunnel)</option>',
-        '    <option value="fei">🚀 fei 直连 (Tailscale)</option>',
-        '    <option value="fei-tunnel">🛡️ fei-tunnel (VPS 反代)</option>',
+        '    <option value="auto">⚡ 智能双路 (直连 → 隧道)</option>',
+        '    <option value="direct">🚀 直连</option>',
+        '    <option value="tunnel">🛡️ 跳板隧道</option>',
         '    <option value="local">💻 仅本机 (暂停隧道)</option>',
         '  </select>',
         '  <button type="button" class="ag-ssh-btn ag-ssh-btn-icon" id="ag-ssh-refresh-btn" title="重探双路延迟并刷新本机+远程项目列表">↻</button>',
@@ -1444,6 +1450,13 @@
     const modeSelect = card.querySelector('#ag-ssh-mode-select');
     const primaryBtn = card.querySelector('#ag-ssh-primary-btn');
     const secondaryBtn = card.querySelector('#ag-ssh-secondary-btn');
+    if (modeSelect) {
+      // Show which ssh alias each route uses as a tooltip, without putting aliases in the code.
+      for (const opt of modeSelect.options) {
+        const host = sshState.routeHosts?.[opt.value];
+        opt.title = host ? `ssh ${host}` : '';
+      }
+    }
 
     if (dot) {
       dot.className = 'ag-ssh-dot ' + (
@@ -1568,9 +1581,9 @@
       const sshSelect = document.createElement('select');
       sshSelect.id = 'fei-ag-ssh-select';
       for (const [value, name] of [
-        ['auto', '智能双路 (fei → tunnel)'],
-        ['fei', 'fei 直连 (Tailscale)'],
-        ['fei-tunnel', 'fei-tunnel (VPS 反代)'],
+        ['auto', '智能双路 (直连 → 隧道)'],
+        ['direct', '直连'],
+        ['tunnel', '跳板隧道'],
         ['local', '仅本机'],
       ]) {
         const option = document.createElement('option'); option.value = value; option.textContent = name; sshSelect.append(option);

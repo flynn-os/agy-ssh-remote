@@ -9,9 +9,11 @@ Manages:
      - Hooks window.extensions -> window.__agExtensions (Sidecar dynamic port forwarding)
      - Sets window.process.platform = "linux" and window.languageServer overrides
   3. OAuth token sync (~/.gemini/jetski-standalone-oauth-token)
-  4. Persistent daemon lifecycle (~/.antigravity-server/run/server.json) shared across fei and fei-tunnel
+  4. Persistent daemon lifecycle (~/.antigravity-server/run/server.json) shared across the direct and tunnel routes
   5. Lightweight loopback bridge HTTP server (127.0.0.1:58284) forwarded over the same SSH tunnel for
      zero-overhead status checks, real-time tunnel RTT measurement, OAuth URL polling, and SQLite telemetry.
+  6. Resumable stream relay (/relay/*): holds LS server-streaming subscriptions on this host with a
+     seq-numbered replay buffer so the Mac can resume them after a tunnel drop (docs/resumable-relay.md).
 """
 
 import base64
@@ -32,18 +34,26 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 
 WEB_BUNDLE_PATCH_VERSION = "20261106-ssh-v11"
-BRIDGE_DAEMON_VERSION = "20261107-ssh-v13"
+BRIDGE_DAEMON_VERSION = "20261107-ssh-v14"
 DEFAULT_HTTPS_PORT = 58282
 DEFAULT_HTTP_PORT = 58283
 DEFAULT_BRIDGE_PORT = 58284
 
 
+def _child_env():
+    """Environment for long-lived children (bridge, LS) without the one-shot auth payload."""
+    env = dict(os.environ)
+    env.pop("AG_AUTH_PAYLOAD_B64", None)
+    return env
+
+
 def load_user_env():
     home = os.path.expanduser("~")
-    env = dict(os.environ)
+    env = _child_env()
     env["HOME"] = home
 
     for rc in [".profile", ".bashrc"]:
@@ -533,6 +543,7 @@ def ensure_bridge_daemon(run_dir, preferred_port=DEFAULT_BRIDGE_PORT):
         stdin=subprocess.DEVNULL,
         stdout=log_fd,
         stderr=subprocess.STDOUT,
+        env=_child_env(),
         start_new_session=True,
         close_fds=True,
     )
@@ -582,6 +593,7 @@ def get_status_dict():
         "ok": True,
         "running": alive,
         "bridgeVersion": BRIDGE_DAEMON_VERSION,
+        "relay": RELAY_PROTOCOL_VERSION,
         "hostname": socket.gethostname(),
         "arch": os.uname().machine,
         "homeDir": home,
@@ -598,7 +610,11 @@ def ensure_server(version, execution_id, force_restart=False):
     has_auth = ensure_auth_token()
     home = os.path.expanduser("~")
     run_dir = os.path.join(home, ".antigravity-server", "run")
-    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(run_dir, 0o700)  # holds server.json (CSRF token) and logs
+    except OSError:
+        pass
     state_file = os.path.join(run_dir, "server.json")
     log_path = os.path.join(run_dir, "server.log")
 
@@ -645,7 +661,11 @@ def ensure_server(version, execution_id, force_restart=False):
                 "openUrls": extract_open_urls(log_path),
             }
 
-    csrf_token = prev_state.get("csrfToken") or "fe9a2c44-8811-4b22-9933-aabbccddeeff"
+    # Per-install random token. Older versions fell back to a fixed, publicly known constant;
+    # replace that one if it is still in the saved state.
+    csrf_token = prev_state.get("csrfToken") or ""
+    if not csrf_token or csrf_token == "fe9a2c44-8811-4b22-9933-aabbccddeeff":
+        csrf_token = str(uuid.uuid4())
     kill_existing_ls(run_dir)
 
     https_port = pick_port(DEFAULT_HTTPS_PORT)
@@ -782,7 +802,11 @@ def decode_pbtxt_string(raw_str):
 def _deleted_tombstones_path():
     home = os.path.expanduser("~")
     run_dir = os.path.join(home, ".antigravity-server", "run")
-    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(run_dir, 0o700)  # holds server.json (CSRF token) and logs
+    except OSError:
+        pass
     return os.path.join(run_dir, "deleted_conversations.json")
 
 
@@ -1384,6 +1408,362 @@ def get_git_repo_infos(repo_uris):
     return {"repos": repos}
 
 
+# ---- Resumable stream relay ------------------------------------------------------------
+# The Mac side used to proxy server-streaming RPCs (StreamAgentStateUpdates, ...) straight
+# through the SSH tunnel. When the tunnel dropped, every stream died; the Antigravity UI then
+# reset its conversation state and re-subscribed, which re-downloads the whole trajectory
+# snapshot (hundreds of KB to MBs) over the slow relay route.
+#
+# The relay keeps the language_server subscription here, on the remote host, inside this
+# detached bridge daemon. Every Connect envelope coming out of the LS gets a sequence number
+# and is kept in a bounded replay buffer. The Mac side attaches with `afterSeq` and gets the
+# frames it missed, then the live tail. The LS never sees the disconnect.
+#
+# Wire format (bridge -> Mac), one record after another until the connection closes:
+#   u8 type | u64 seq (BE) | u32 len (BE) | payload[len]
+#   type 1 META  payload = JSON {streamId, status, headers, oldestSeq, lastSeq, resumed}
+#   type 2 FRAME payload = one raw Connect envelope (5-byte header + message), seq = 1, 2, ...
+#   type 3 END   payload = JSON {reason, lastSeq}; upstream finished, no more frames
+#   type 4 BEAT  payload = JSON {lastSeq, ts}; sent when idle so the Mac can detect stalls
+# See docs/resumable-relay.md.
+
+RELAY_PROTOCOL_VERSION = 1
+RELAY_REC_META = 1
+RELAY_REC_FRAME = 2
+RELAY_REC_END = 3
+RELAY_REC_BEAT = 4
+RELAY_HEARTBEAT_S = float(os.environ.get("AG_RELAY_HEARTBEAT_S") or 5.0)
+# Keep a detached stream (and its LS subscription) this long. Must be longer than the Mac
+# side's recovery window (150s) so the Mac always gives up first and never resumes into a
+# stream that has just been reaped.
+RELAY_RETENTION_S = float(os.environ.get("AG_RELAY_RETENTION_S") or 180.0)
+# Replay buffer cap per stream. The first frame of StreamAgentStateUpdates is the full
+# trajectory snapshot and can be several MB, so this is larger than Codex's 1 MiB.
+RELAY_MAX_BUFFER_BYTES = int(os.environ.get("AG_RELAY_MAX_BUFFER_BYTES") or 16 * 1024 * 1024)
+RELAY_MAX_STREAMS = int(os.environ.get("AG_RELAY_MAX_STREAMS") or 64)
+RELAY_WRITE_TIMEOUT_S = 30.0
+RELAY_ALLOWED_PATH_PREFIX = "/exa.language_server_pb.LanguageServerService/"
+RELAY_DROP_REQ_HEADERS = {
+    "host", "connection", "keep-alive", "transfer-encoding", "upgrade", "content-length",
+    "x-codeium-csrf-token", "cookie", "origin", "referer", "accept-encoding", "te",
+}
+RELAY_DROP_RESP_HEADERS = {"transfer-encoding", "connection", "content-length", "date", "keep-alive"}
+
+_relay_lock = threading.Lock()
+_relay_streams = {}
+_relay_janitor_started = False
+
+
+def _relay_upstream_target():
+    """(host, port, csrf) of the LS's plain-HTTP Connect listener."""
+    override = os.environ.get("AG_RELAY_UPSTREAM") or ""
+    if override:
+        host, _, port = override.rpartition(":")
+        return host or "127.0.0.1", int(port), os.environ.get("AG_RELAY_CSRF") or ""
+    state_file = os.path.join(os.path.expanduser("~"), ".antigravity-server", "run", "server.json")
+    with open(state_file, "r", encoding="utf-8") as f:
+        st = json.load(f)
+    return "127.0.0.1", int(st.get("httpPort") or DEFAULT_HTTP_PORT), st.get("csrfToken") or ""
+
+
+def _relay_record(rtype, seq, payload):
+    if isinstance(payload, (dict, list)):
+        payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return struct.pack(">BQI", rtype, seq, len(payload)) + payload
+
+
+def _connect_end_error(code, message):
+    body = json.dumps({"error": {"code": code, "message": message}}).encode("utf-8")
+    return struct.pack(">BI", 0x02, len(body)) + body
+
+
+class RelayStream:
+    def __init__(self, stream_id, path, headers, body):
+        self.id = stream_id
+        self.path = path
+        self.req_headers = headers
+        self.req_body = body
+        self.cond = threading.Condition()
+        self.frames = []          # [(seq, bytes)], contiguous seqs
+        self.buffer_bytes = 0
+        self.last_seq = 0
+        self.evicted_upto = 0     # highest seq dropped from the buffer
+        self.status = 0
+        self.resp_headers = {}
+        self.ready = False        # upstream response headers received
+        self.ended = False
+        self.end_reason = ""
+        self.attach_gen = 0
+        self.writers = 0
+        self.detached_since = time.time()
+        self.created = time.time()
+        self.attaches = 0
+        self.conn = None
+        self.closed = False
+
+    # -- upstream --------------------------------------------------------------------
+    def start(self):
+        threading.Thread(target=self._pump, name=f"relay-{self.id[:8]}", daemon=True).start()
+
+    def _append(self, data):
+        with self.cond:
+            self.last_seq += 1
+            self.frames.append((self.last_seq, data))
+            self.buffer_bytes += len(data)
+            # Always keep the newest frame, even if it alone exceeds the cap.
+            while self.buffer_bytes > RELAY_MAX_BUFFER_BYTES and len(self.frames) > 1:
+                seq, old = self.frames.pop(0)
+                self.buffer_bytes -= len(old)
+                self.evicted_upto = seq
+            self.cond.notify_all()
+
+    def _finish(self, reason):
+        with self.cond:
+            if self.ended:
+                return
+            self.ended = True
+            self.end_reason = reason
+            self.cond.notify_all()
+
+    def _pump(self):
+        import http.client
+
+        try:
+            host, port, csrf = _relay_upstream_target()
+            headers = {k: v for k, v in self.req_headers.items() if k.lower() not in RELAY_DROP_REQ_HEADERS}
+            headers.setdefault("content-type", "application/connect+json")
+            headers.setdefault("connect-protocol-version", "1")
+            if csrf:
+                headers["x-codeium-csrf-token"] = csrf
+            self.conn = http.client.HTTPConnection(host, port, timeout=None)
+            self.conn.request("POST", self.path, body=self.req_body, headers=headers)
+            resp = self.conn.getresponse()
+            with self.cond:
+                self.status = resp.status
+                self.resp_headers = {
+                    k.lower(): v for k, v in resp.getheaders() if k.lower() not in RELAY_DROP_RESP_HEADERS
+                }
+                self.ready = True
+                self.cond.notify_all()
+            if resp.status != 200:
+                self._append(resp.read())
+                self._finish("upstream-status")
+                return
+            while not self.closed:
+                hdr = resp.read(5)
+                if not hdr:
+                    break
+                if len(hdr) < 5:
+                    raise IOError("truncated envelope header")
+                flags, length = struct.unpack(">BI", hdr)
+                payload = resp.read(length) if length else b""
+                if len(payload) < length:
+                    raise IOError("truncated envelope")
+                self._append(hdr + payload)
+                if flags & 0x02:  # Connect end-of-stream envelope
+                    self._finish("upstream-end")
+                    return
+            self._finish("upstream-eof")
+        except Exception as e:
+            if self.closed:
+                self._finish("closed")
+                return
+            with self.cond:
+                if not self.ready:
+                    self.status = 200
+                    self.resp_headers = {"content-type": self.req_headers.get("content-type") or "application/connect+json"}
+                    self.ready = True
+            # Tell the client the stream is over so the UI re-subscribes (to a new LS if it restarted).
+            self._append(_connect_end_error("unavailable", f"relay upstream lost: {e}"))
+            self._finish("upstream-error")
+        finally:
+            try:
+                if self.conn:
+                    self.conn.close()
+            except Exception:
+                pass
+
+    def close(self):
+        self.closed = True
+        try:
+            if self.conn and self.conn.sock:
+                self.conn.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        self._finish("closed")
+
+    # -- downstream -----------------------------------------------------------------
+    def serve(self, wfile, after_seq):
+        """Write META, replay frames after `after_seq`, then follow live. Runs in the handler thread."""
+        with self.cond:
+            self.attach_gen += 1
+            gen = self.attach_gen
+            self.writers += 1
+            self.attaches += 1
+            self.detached_since = None
+            self.cond.notify_all()  # wake (and thereby preempt) any older writer
+            deadline = time.time() + 30.0
+            while not self.ready and not self.ended and time.time() < deadline:
+                self.cond.wait(1.0)
+        try:
+            if after_seq and after_seq < self.evicted_upto:
+                wfile.write(_relay_record(RELAY_REC_END, self.last_seq, {"reason": "gap", "oldestSeq": self.evicted_upto + 1}))
+                return
+            meta = {
+                "streamId": self.id,
+                "status": self.status or 200,
+                "headers": self.resp_headers,
+                "oldestSeq": self.evicted_upto + 1,
+                "lastSeq": self.last_seq,
+                "resumed": after_seq > 0,
+            }
+            wfile.write(_relay_record(RELAY_REC_META, 0, meta))
+            cursor = after_seq
+            while True:
+                with self.cond:
+                    if gen != self.attach_gen:
+                        return  # a newer attach took over
+                    if self.last_seq <= cursor and not self.ended:
+                        self.cond.wait(RELAY_HEARTBEAT_S)
+                    if gen != self.attach_gen:
+                        return
+                    if cursor < self.evicted_upto:
+                        batch = None
+                    else:
+                        start = 0
+                        if self.frames:
+                            start = max(0, cursor + 1 - self.frames[0][0])
+                        batch = self.frames[start:]
+                    ended = self.ended
+                    last = self.last_seq
+                if batch is None:
+                    wfile.write(_relay_record(RELAY_REC_END, last, {"reason": "gap", "oldestSeq": self.evicted_upto + 1}))
+                    return
+                if batch:
+                    wfile.write(b"".join(_relay_record(RELAY_REC_FRAME, s, d) for s, d in batch))
+                    cursor = batch[-1][0]
+                elif not ended:
+                    wfile.write(_relay_record(RELAY_REC_BEAT, cursor, {"lastSeq": cursor, "ts": int(time.time() * 1000)}))
+                if ended and cursor >= last:
+                    wfile.write(_relay_record(RELAY_REC_END, cursor, {"reason": self.end_reason, "lastSeq": cursor}))
+                    return
+        finally:
+            with self.cond:
+                self.writers -= 1
+                if self.writers <= 0:
+                    self.writers = 0
+                    self.detached_since = time.time()
+
+    def stats(self):
+        with self.cond:
+            return {
+                "id": self.id,
+                "path": self.path.rsplit("/", 1)[-1],
+                "lastSeq": self.last_seq,
+                "oldestSeq": self.evicted_upto + 1,
+                "bufferBytes": self.buffer_bytes,
+                "ended": self.ended,
+                "endReason": self.end_reason,
+                "writers": self.writers,
+                "attaches": self.attaches,
+                "detachedFor": round(time.time() - self.detached_since, 1) if self.detached_since else 0,
+                "ageS": round(time.time() - self.created, 1),
+            }
+
+
+def _relay_janitor():
+    while True:
+        time.sleep(5.0)
+        now = time.time()
+        reap = []
+        with _relay_lock:
+            for sid, s in list(_relay_streams.items()):
+                idle = s.detached_since is not None and now - s.detached_since > (
+                    RELAY_RETENTION_S
+                )
+                if idle:
+                    reap.append(_relay_streams.pop(sid))
+        for s in reap:
+            s.close()
+
+
+def relay_get_or_create(stream_id, after_seq, path, headers, body):
+    global _relay_janitor_started
+    with _relay_lock:
+        if not _relay_janitor_started:
+            _relay_janitor_started = True
+            threading.Thread(target=_relay_janitor, name="relay-janitor", daemon=True).start()
+        s = _relay_streams.get(stream_id)
+        if s is not None:
+            return s, None
+        if after_seq > 0:
+            return None, (404, {"ok": False, "error": "unknown-stream"})
+        if not path.startswith(RELAY_ALLOWED_PATH_PREFIX):
+            return None, (400, {"ok": False, "error": "path not allowed"})
+        if len(_relay_streams) >= RELAY_MAX_STREAMS:
+            # Evict the longest-detached stream rather than refusing.
+            detached = [x for x in _relay_streams.values() if x.detached_since is not None]
+            if not detached:
+                return None, (503, {"ok": False, "error": "too many relay streams"})
+            victim = min(detached, key=lambda x: x.detached_since)
+            _relay_streams.pop(victim.id, None)
+            victim.close()
+        s = RelayStream(stream_id, path, headers, body)
+        _relay_streams[stream_id] = s
+    s.start()
+    return s, None
+
+
+def relay_close(stream_id):
+    with _relay_lock:
+        s = _relay_streams.pop(stream_id, None)
+    if s:
+        s.close()
+    return {"ok": True, "closed": bool(s)}
+
+
+def relay_stats():
+    with _relay_lock:
+        streams = list(_relay_streams.values())
+    return {"ok": True, "protocol": RELAY_PROTOCOL_VERSION, "streams": [s.stats() for s in streams]}
+
+
+def handle_relay_stream(handler):
+    """POST /relay/stream  {id, afterSeq, path, headers, bodyB64} -> record stream (open or resume)."""
+    try:
+        clen = int(handler.headers.get("Content-Length") or "0")
+        req = json.loads(handler.rfile.read(clen).decode("utf-8") or "{}") if clen > 0 else {}
+        stream_id = str(req.get("id") or "")
+        if not re.match(r"^[A-Za-z0-9_-]{8,80}$", stream_id):
+            handler._send_json(400, {"ok": False, "error": "bad id"})
+            return
+        after_seq = int(req.get("afterSeq") or 0)
+        body = base64.b64decode(req.get("bodyB64") or "")
+        headers = req.get("headers") if isinstance(req.get("headers"), dict) else {}
+        s, err = relay_get_or_create(stream_id, after_seq, str(req.get("path") or ""), headers, body)
+    except Exception as e:
+        handler._send_json(400, {"ok": False, "error": str(e)})
+        return
+    if err:
+        handler._send_json(err[0], err[1])
+        return
+    handler.close_connection = True
+    try:
+        handler.connection.settimeout(RELAY_WRITE_TIMEOUT_S)
+        handler.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/x-ag-relay")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Ag-Relay-Protocol", str(RELAY_PROTOCOL_VERSION))
+    handler.end_headers()
+    try:
+        s.serve(handler.wfile, after_seq)
+    except Exception:
+        pass  # client went away; the stream stays buffered for RELAY_RETENTION_S
+
+
 class BridgeHandler(http.server.BaseHTTPRequestHandler):
     timeout = 5
 
@@ -1418,11 +1798,20 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         elif parsed.path == "/cli-summaries":
             sig = (qs.get("sig") or [""])[0]
             self._send_json(200, get_cli_summaries(sig))
+        elif parsed.path == "/relay/stats":
+            self._send_json(200, relay_stats())
         else:
             self._send_json(404, {"ok": False, "error": "Not found"})
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/relay/stream":
+            handle_relay_stream(self)
+            return
+        if parsed.path == "/relay/close":
+            qs = urllib.parse.parse_qs(parsed.query)
+            self._send_json(200, relay_close((qs.get("id") or [""])[0]))
+            return
         if parsed.path == "/restart":
             try:
                 clen = int(self.headers.get("Content-Length") or "0")
@@ -1467,10 +1856,13 @@ def _background_sync_loop():
 
 
 def run_bridge_daemon(port):
-    sanitize_git_worktree_configs()
-    sync_cli_store()
-    t = threading.Thread(target=_background_sync_loop, daemon=True)
-    t.start()
+    # AG_BRIDGE_RELAY_ONLY=1: test instance (scripts/relay-*-test.mjs) that must not touch the
+    # CLI store or git configs the real bridge manages.
+    if os.environ.get("AG_BRIDGE_RELAY_ONLY") != "1":
+        sanitize_git_worktree_configs()
+        sync_cli_store()
+        t = threading.Thread(target=_background_sync_loop, daemon=True)
+        t.start()
     server_cls = getattr(http.server, "ThreadingHTTPServer", http.server.HTTPServer)
     server_cls.allow_reuse_address = True
     server = server_cls(("127.0.0.1", port), BridgeHandler)

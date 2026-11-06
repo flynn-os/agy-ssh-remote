@@ -10,6 +10,8 @@ import {DatabaseSync} from 'node:sqlite';
 import tls from 'node:tls';
 import {fileURLToPath} from 'node:url';
 import {promisify} from 'node:util';
+import {ResumableRelayStream} from './relay-client.mjs';
+import {routeHosts, hostForMode, normalizeSshMode} from './routes.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -38,7 +40,7 @@ const LOCAL_WWW_CACHE_DIR = path.join(CACHE_DIR, 'www');
 const LOCAL_WWW_META_PATH = path.join(CACHE_DIR, 'www-meta.json');
 const LOCAL_DELETED_TOMBSTONES_PATH = path.join(CACHE_DIR, 'deleted-conversations.json');
 const LOCAL_WWW_PATCH_VERSION = '20261103-ssh-v10';
-const EXPECTED_BRIDGE_VERSION = '20261107-ssh-v13';
+const EXPECTED_BRIDGE_VERSION = '20261107-ssh-v14';
 const LOCAL_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
 const LOCAL_CLI_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'conversations');
 const APP_INFO_PLIST_PATH = '/Applications/Antigravity.app/Contents/Info.plist';
@@ -96,10 +98,32 @@ export async function resolveExecutionIdForVersion(version) {
 
 export const REMOTE_DEFAULT_PROJECT_ALIAS = 'ssh-default-cli-project';
 
-const SSH_CONTROL_DIR = `/tmp/ag-mux-${typeof process.getuid === 'function' ? process.getuid() : 0}`;
-try {
-  fs.mkdirSync(SSH_CONTROL_DIR, {recursive: true, mode: 0o700});
-} catch {}
+// ssh ControlMaster sockets. /tmp is shared, so only use the /tmp dir if we own it and it is
+// private; otherwise another local user could pre-create it and plant a fake master socket
+// (which would see the auth payload sent over stdin). Fall back to ~/.ssh.
+function privateDirOk(dir) {
+  try {
+    const st = fs.lstatSync(dir);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : st.uid;
+    return st.isDirectory() && !st.isSymbolicLink() && st.uid === uid && (st.mode & 0o077) === 0;
+  } catch {
+    return false;
+  }
+}
+
+function resolveSshControlDir() {
+  const candidates = [
+    `/tmp/ag-mux-${typeof process.getuid === 'function' ? process.getuid() : 0}`,
+    path.join(os.homedir(), '.ssh', 'ag-mux'),
+  ];
+  for (const dir of candidates) {
+    try { fs.mkdirSync(dir, {recursive: true, mode: 0o700}); } catch {}
+    if (privateDirOk(dir)) return dir;
+  }
+  return candidates[1];
+}
+
+const SSH_CONTROL_DIR = resolveSshControlDir();
 
 const SSH_COMMON_ARGS = [
   '-o', 'BatchMode=yes',
@@ -123,6 +147,9 @@ const SSH_TUNNEL_ARGS = [
   '-o', 'ServerAliveInterval=15',
   '-o', 'ServerAliveCountMax=4',
   '-o', 'TCPKeepAlive=no',
+  // Bridge, relay and metrics traffic is plain JSON and compresses several-fold; matters on
+  // the slow relay route.
+  '-o', 'Compression=yes',
 ];
 
 const SSH_MUX_ARGS = [
@@ -153,10 +180,7 @@ export const sshState = {
   localMacCsrfToken: '',
   hasAuth: false,
   lastError: '',
-  routeLatencies: {
-    fei: null,
-    'fei-tunnel': null,
-  },
+  routeLatencies: {},
   sidecarPorts: [],
   projectEnvMap: {},
   localProjectIds: [],
@@ -292,6 +316,7 @@ export function getSshState() {
   }
   return {
     ...sshState,
+    routeHosts: {...routeHosts()},
     routeLatencies: {...sshState.routeLatencies},
     sidecarPorts: [...sidecarTunnels.keys()],
     projectEnvMap: {...sshState.projectEnvMap},
@@ -316,6 +341,9 @@ function extractCertAndKey() {
   const certPath = path.join(tlsDir, 'cert.pem');
   const keyPath = path.join(tlsDir, 'key.pem');
   if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+    try {
+      if (fs.statSync(keyPath).mode & 0o077) fs.chmodSync(keyPath, 0o600);
+    } catch {}
     return {
       cert: fs.readFileSync(certPath, 'utf8'),
       key: fs.readFileSync(keyPath, 'utf8'),
@@ -711,6 +739,9 @@ function sendUnaryRpcResponse(req, res, jsonObj) {
   }
 }
 
+const UNARY_TIMEOUTS_BEFORE_RESET = 3;
+const unaryTimeoutStreak = {local: 0, remote: 0};
+
 async function callUpstreamUnaryJson(target, methodName, payloadObj = {}, timeoutMs = 4500) {
   if (target === 'remote' && sshState.status !== 'connected') {
     return null;
@@ -725,18 +756,27 @@ async function callUpstreamUnaryJson(target, methodName, payloadObj = {}, timeou
   return new Promise((resolve) => {
     let settled = false;
     let uReq = null;
-    const done = (val, failed = false) => {
+    // failed: 'stream' = this call broke, 'timeout' = it was slow. A slow call on a slow link
+    // must not destroy the shared H2 session (that kills every other in-flight RPC and stream);
+    // only reset after several consecutive timeouts, or on a stream-level error.
+    const done = (val, failed = '') => {
       if (!settled) {
         settled = true;
         if (failed) {
           try { uReq?.close(); } catch {}
-          if (target === 'remote') resetUpstreamH2();
-          else resetLocalUpstreamH2();
+          const timeouts = failed === 'timeout' ? (unaryTimeoutStreak[target] += 1) : UNARY_TIMEOUTS_BEFORE_RESET;
+          if (timeouts >= UNARY_TIMEOUTS_BEFORE_RESET) {
+            unaryTimeoutStreak[target] = 0;
+            if (target === 'remote') resetUpstreamH2();
+            else resetLocalUpstreamH2();
+          }
+        } else {
+          unaryTimeoutStreak[target] = 0;
         }
         resolve(val);
       }
     };
-    const timer = setTimeout(() => done(null, true), timeoutMs);
+    const timer = setTimeout(() => done(null, 'timeout'), target === 'remote' ? adaptiveTimeout(timeoutMs) : timeoutMs);
     try {
       const bodyBuf = Buffer.from(JSON.stringify(payloadObj), 'utf8');
       uReq = h2.request({
@@ -760,12 +800,12 @@ async function callUpstreamUnaryJson(target, methodName, payloadObj = {}, timeou
       });
       uReq.on('error', () => {
         clearTimeout(timer);
-        done(null, true);
+        done(null, 'stream');
       });
       uReq.end(bodyBuf);
     } catch {
       clearTimeout(timer);
-      done(null, true);
+      done(null, 'stream');
     }
   });
 }
@@ -2178,7 +2218,7 @@ export async function syncCliSummariesAndPushUpdates() {
 
         // 2. Remote CLI + App store sync via bridge /cli-summaries
     if (sshState.status === 'connected') {
-      const remoteRes = await fetchBridgeJson(`/cli-summaries?sig=${encodeURIComponent(lastRemoteCliSummariesBridgeSig)}`, 3000);
+      const remoteRes = await fetchBridgeJson(`/cli-summaries?sig=${encodeURIComponent(lastRemoteCliSummariesBridgeSig)}`, adaptiveTimeout(3000), {bodyIdleMs: 15000});
       if (remoteRes?.ok && !remoteRes.unchanged) {
         if (remoteRes.sig) lastRemoteCliSummariesBridgeSig = remoteRes.sig;
         if (Array.isArray(remoteRes.archivedIds)) {
@@ -2420,73 +2460,85 @@ async function fetchLocalGitRepoInfosFallback(uris) {
 }
 
 let lastBridgeRepoInfosCache = new Map(); // uri -> { ts, repo }
-const bridgeHttpAgent = new http.Agent({keepAlive: true, maxSockets: 8});
+// Bulk bridge traffic (/metrics, /cli-summaries, /repo-infos) and health checks use separate
+// pools: on a slow link a few multi-MB downloads used to occupy every pooled socket, and a
+// /ping queued behind them never ran, so the health check went blind for minutes.
+const bridgeHttpAgent = new http.Agent({keepAlive: true, maxSockets: 6});
+const bridgeControlAgent = new http.Agent({keepAlive: true, maxSockets: 2});
 
-function fetchBridgeJson(urlPath, timeoutMs = 3500) {
+/**
+ * One bridge HTTP call with a wall-clock deadline. Node's `timeout` option only fires on an
+ * idle socket: it never fires while a request waits for a pooled socket, or while a large
+ * response trickles in, so it cannot bound how long a call takes.
+ * Resolves {status, body: Buffer, ms} or null on error/deadline.
+ * `bodyIdleMs`: for large downloads, the deadline only covers getting the response head;
+ * after that the call lives as long as bytes keep arriving (no gap longer than bodyIdleMs),
+ * so a slow-but-working multi-MB transfer is not cut off and re-started over and over.
+ */
+function bridgeRequest({port, method = 'GET', path: urlPath, body = null, deadlineMs = 3500, control = false, bodyIdleMs = 0}) {
   return new Promise((resolve) => {
-    const req = http.get(
+    const t0 = Date.now();
+    let done = false;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const headers = body ? {'content-type': 'application/json', 'content-length': String(body.length)} : {};
+    const req = http.request(
       {
+        method,
         hostname: '127.0.0.1',
-        port: sshState.localBridgePort || 58284,
+        port: port || sshState.localBridgePort || 58284,
         path: urlPath,
-        agent: bridgeHttpAgent,
-        timeout: timeoutMs,
+        agent: control ? bridgeControlAgent : bridgeHttpAgent,
+        headers,
       },
       (res) => {
-        let body = '';
-        res.on('data', (d) => { body += d.toString(); });
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(body));
-          } catch {
-            resolve(null);
-          }
+        const chunks = [];
+        const armIdle = () => {
+          if (!bodyIdleMs) return;
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            req.destroy();
+            finish(null);
+          }, bodyIdleMs);
+        };
+        armIdle();
+        res.on('data', (d) => {
+          chunks.push(d);
+          armIdle();
         });
+        res.on('end', () => finish({status: res.statusCode, body: Buffer.concat(chunks), ms: Date.now() - t0}));
+        res.on('error', () => finish(null));
       }
     );
-    req.on('timeout', () => {
+    let timer = setTimeout(() => {
       req.destroy();
-      resolve(null);
-    });
-    req.on('error', () => resolve(null));
+      finish(null);
+    }, deadlineMs);
+    req.on('error', () => finish(null));
+    req.end(body || undefined);
   });
 }
 
-function postBridgeJson(urlPath, payload = {}, timeoutMs = 3500) {
-  return new Promise((resolve) => {
-    const bodyBuf = Buffer.from(JSON.stringify(payload), 'utf8');
-    const req = http.request(
-      {
-        method: 'POST',
-        hostname: '127.0.0.1',
-        port: sshState.localBridgePort || 58284,
-        path: urlPath,
-        agent: bridgeHttpAgent,
-        headers: {
-          'content-type': 'application/json',
-          'content-length': String(bodyBuf.length),
-        },
-        timeout: timeoutMs,
-      },
-      (res) => {
-        let body = '';
-        res.on('data', (d) => { body += d.toString(); });
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(body));
-          } catch {
-            resolve(null);
-          }
-        });
-      }
-    );
-    req.on('timeout', () => {
-      req.destroy();
-      resolve(null);
-    });
-    req.on('error', () => resolve(null));
-    req.end(bodyBuf);
-  });
+function parseBridgeJson(res) {
+  if (!res) return null;
+  try {
+    return JSON.parse(res.body.toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+async function fetchBridgeJson(urlPath, timeoutMs = 3500, {bodyIdleMs = 0} = {}) {
+  return parseBridgeJson(await bridgeRequest({path: urlPath, deadlineMs: timeoutMs, bodyIdleMs}));
+}
+
+async function postBridgeJson(urlPath, payload = {}, timeoutMs = 3500) {
+  const body = Buffer.from(JSON.stringify(payload), 'utf8');
+  return parseBridgeJson(await bridgeRequest({method: 'POST', path: urlPath, body, deadlineMs: timeoutMs}));
 }
 
 async function fetchRemoteGitRepoInfosFallback(uris) {
@@ -2496,7 +2548,7 @@ async function fetchRemoteGitRepoInfosFallback(uris) {
   if (Array.isArray(bridgeRes?.repos) && bridgeRes.repos.length > 0) {
     return bridgeRes.repos;
   }
-  const host = sshState.activeHost || 'fei';
+  const host = sshState.activeHost || routeHosts().direct;
   const repos = [];
   for (const rawUri of uris) {
     const uri = String(rawUri || '').replace(/\/+$/, '');
@@ -2506,7 +2558,7 @@ async function fetchRemoteGitRepoInfosFallback(uris) {
       const pyScript = `import json, os, subprocess, sys; p = sys.argv[1]; u = sys.argv[2]; h = subprocess.run(["git", "-C", p, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=3); r = subprocess.run(["git", "-C", p, "for-each-ref", "--format=%(refname:short)", "refs/heads"], capture_output=True, text=True, timeout=3); cur = h.stdout.strip(); bs = [{"name": b.strip(), **({"isCurrentBranch": True} if b.strip() == cur else {})} for b in r.stdout.splitlines() if b.strip()]; print(json.dumps({"name": os.path.basename(p), "repoPath": p, "branches": bs, "scmType": "SCM_TYPE_GIT", "repoUri": u} if h.returncode == 0 else {}))`;
       const {stdout} = await execFileAsync(
         'ssh',
-        ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4', host, `python3 -c '${pyScript}' '${repoPath.replace(/'/g, "'\\''")}' '${uri.replace(/'/g, "'\\''")}'`],
+        ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4', ...SSH_MUX_ARGS, host, `python3 -c '${pyScript}' '${repoPath.replace(/'/g, "'\\''")}' '${uri.replace(/'/g, "'\\''")}'`],
         {timeout: 5000}
       );
       const parsed = JSON.parse(stdout.trim());
@@ -3408,6 +3460,13 @@ function ensureLocalHttpsProxy() {
         return;
       }
 
+      if (req.method === 'GET' && reqPath === '/__ag/relay-stats') {
+        const body = Buffer.from(JSON.stringify({enabled: RELAY_ENABLED, remoteProtocol: remoteRelayProtocol, methods: [...RELAY_STREAM_METHODS], streams: getRelayStats()}), 'utf8');
+        writeSafeHead(res, 200, {'content-type': 'application/json', 'content-length': String(body.length)}, req.headers);
+        res.end(body);
+        return;
+      }
+
       // Serve static files from local patched www cache when requested via GET
       if (req.method === 'GET' || req.method === 'HEAD') {
         const cachedEntry = getCachedFileEntry(reqPath);
@@ -3539,6 +3598,11 @@ function ensureLocalHttpsProxy() {
               sendUnaryRpcResponse(req, res, cachedRemoteAuthStatus);
               return;
             }
+            if (methodName === 'CreateProject' && parsedJson?.project?.id) {
+              // Re-creating a previously deleted id must clear its tombstone. LS 2.29 answers
+              // CreateProject with `{}`, so the response-side cleanup below never sees the id.
+              deletedProjectIdsSet.delete(parsedJson.project.id);
+            }
             if (
               methodName === 'StartCascade' ||
               methodName === 'SendUserCascadeMessage'
@@ -3660,6 +3724,11 @@ function ensureLocalHttpsProxy() {
             }
             if (targetCsrf) {
               outHeaders['x-codeium-csrf-token'] = targetCsrf;
+            }
+
+            if (target === 'remote' && shouldRelayStream(methodName)) {
+              startRelayedStream(req, res, reqPath, outHeaders, forwardBody, parsedJson);
+              return;
             }
 
             const uReq = h2.request(outHeaders);
@@ -3850,6 +3919,76 @@ function ensureLocalHttpsProxy() {
   } catch {}
 }
 
+// ---- Resumable stream relay (docs/resumable-relay.md) ---------------------------------
+// Server-streaming RPCs listed here are not proxied over the H2 tunnel session. Instead the
+// remote bridge holds the LS subscription and we resume it by sequence number after a tunnel
+// drop, so the browser's stream (and the UI's conversation state) survives reconnects.
+const RELAY_STREAM_METHODS = new Set(
+  (process.env.AG_SSH_RELAY_METHODS || 'StreamAgentStateUpdates').split(',').map((m) => m.trim()).filter(Boolean)
+);
+const RELAY_ENABLED = process.env.AG_SSH_RELAY !== '0';
+let remoteRelayProtocol = 0;
+const activeRelayStreams = new Set();
+const relayReconnectWaiters = new Set();
+
+function shouldRelayStream(methodName) {
+  return RELAY_ENABLED && remoteRelayProtocol >= 1 && RELAY_STREAM_METHODS.has(methodName);
+}
+
+function notifyRelayReconnected() {
+  for (const fn of [...relayReconnectWaiters]) {
+    try { fn(); } catch {}
+  }
+}
+
+export function getRelayStats() {
+  return [...activeRelayStreams].map((s) => ({
+    id: s.id,
+    method: s.label,
+    lastSeq: s.lastSeq,
+    attempt: s.attempt,
+    brokenForMs: s.brokenSince ? Date.now() - s.brokenSince : 0,
+    ...s.stats,
+  }));
+}
+
+function startRelayedStream(req, res, reqPath, outHeaders, forwardBody, parsedJson) {
+  const headers = {};
+  for (const [k, v] of Object.entries(outHeaders)) {
+    if (!k.startsWith(':')) headers[k] = Array.isArray(v) ? v.join(', ') : String(v);
+  }
+  const cid = parsedJson?.conversationId || parsedJson?.cascadeId || '';
+  const stream = new ResumableRelayStream({
+    label: `${reqPath.split('/').pop()}${cid ? ` ${cid.slice(0, 8)}` : ''}`,
+    getBridge: () =>
+      sshState.status === 'connected' && sshState.localBridgePort
+        ? {host: '127.0.0.1', port: sshState.localBridgePort}
+        : null,
+    onReconnected: (fn) => {
+      relayReconnectWaiters.add(fn);
+      return () => relayReconnectWaiters.delete(fn);
+    },
+    request: {path: reqPath, headers, body: forwardBody},
+    log: logSsh,
+    sink: {
+      writeHead: (status, h) => writeSafeHead(res, status, h, req.headers),
+      write: (buf) => {
+        if (!res.writableEnded && !res.destroyed) res.write(buf);
+      },
+      end: () => {
+        activeRelayStreams.delete(stream);
+        if (!res.writableEnded && !res.destroyed) res.end();
+      },
+    },
+  });
+  activeRelayStreams.add(stream);
+  res.on('close', () => {
+    activeRelayStreams.delete(stream);
+    stream.cancel();
+  });
+  stream.start();
+}
+
 function handleOpenUrls(urls, host) {
   if (!Array.isArray(urls)) return;
   for (const rawUrl of urls) {
@@ -3900,7 +4039,7 @@ export async function ensureSidecarTunnel(host, port) {
 }
 
 export async function syncSidecarAuthorities(portMap = {}) {
-  const host = mainTunnelHost || sshState.activeHost || 'fei';
+  const host = mainTunnelHost || sshState.activeHost || routeHosts().direct;
   if (!host || sshState.status !== 'connected') return;
   let parsedMap = portMap;
   if (typeof portMap === 'string') {
@@ -4048,16 +4187,19 @@ export function probeHostRtt(host, timeoutMs = 4500) {
 }
 export const probeSshHost = probeHostRtt;
 
-export async function selectBestHost(mode = 'auto', probeFn = probeHostRtt) {
-  if (mode === 'fei' || mode === 'fei-tunnel') {
-    const fallback = mode === 'fei' ? 'fei-tunnel' : 'fei';
-    const primaryTimeoutMs = mode === 'fei-tunnel' ? 9000 : 6000;
-    const fallbackTimeoutMs = fallback === 'fei-tunnel' ? 9000 : 6000;
-    const primaryPromise = probeFn(mode, primaryTimeoutMs).then((res) => {
-      sshState.routeLatencies[mode] = res.ok ? res.latencyMs : null;
+export async function selectBestHost(requestedMode = 'auto', probeFn = probeHostRtt) {
+  const mode = normalizeSshMode(requestedMode);
+  const {direct: DIRECT_HOST, tunnel: TUNNEL_HOST} = routeHosts();
+  if (mode === 'direct' || mode === 'tunnel') {
+    const primary = hostForMode(mode);
+    const fallback = mode === 'direct' ? TUNNEL_HOST : DIRECT_HOST;
+    const primaryTimeoutMs = mode === 'tunnel' ? 9000 : 6000;
+    const fallbackTimeoutMs = mode === 'direct' ? 9000 : 6000;
+    const primaryPromise = probeFn(primary, primaryTimeoutMs).then((res) => {
+      sshState.routeLatencies[primary] = res.ok ? res.latencyMs : null;
       emitState({});
       return res;
-    }).catch(() => ({host: mode, ok: false, latencyMs: Infinity}));
+    }).catch(() => ({host: primary, ok: false, latencyMs: Infinity}));
 
     const quickPrimary = await Promise.race([
       primaryPromise,
@@ -4078,16 +4220,16 @@ export async function selectBestHost(mode = 'auto', probeFn = probeHostRtt) {
 
     const fbProbe = await fbPromise;
     if (fbProbe.ok) return fbProbe;
-    throw new Error(`Both ${mode} and ${fallback} are unreachable`);
+    throw new Error(`Both ${primary} and ${fallback} are unreachable`);
   }
 
-  const directPromise = probeFn('fei', 6000).then((res) => {
-    sshState.routeLatencies.fei = res.ok ? res.latencyMs : null;
+  const directPromise = probeFn(DIRECT_HOST, 6000).then((res) => {
+    sshState.routeLatencies[DIRECT_HOST] = res.ok ? res.latencyMs : null;
     emitState({});
     return res;
-  }).catch(() => ({host: 'fei', ok: false, latencyMs: Infinity}));
+  }).catch(() => ({host: DIRECT_HOST, ok: false, latencyMs: Infinity}));
 
-  // If direct route ('fei') responds within 250ms, return immediately without spawning fei-tunnel
+  // If the direct route responds within 250ms, return immediately without probing the tunnel
   const directImmediate = await Promise.race([
     directPromise,
     new Promise((r) => setTimeout(() => r(null), 250)),
@@ -4096,14 +4238,14 @@ export async function selectBestHost(mode = 'auto', probeFn = probeHostRtt) {
     return directImmediate;
   }
 
-  const tunnelPromise = probeFn('fei-tunnel', 9000).then((res) => {
-    sshState.routeLatencies['fei-tunnel'] = res.ok ? res.latencyMs : null;
+  const tunnelPromise = probeFn(TUNNEL_HOST, 9000).then((res) => {
+    sshState.routeLatencies[TUNNEL_HOST] = res.ok ? res.latencyMs : null;
     emitState({});
     return res;
-  }).catch(() => ({host: 'fei-tunnel', ok: false, latencyMs: Infinity}));
+  }).catch(() => ({host: TUNNEL_HOST, ok: false, latencyMs: Infinity}));
 
   if (!directImmediate) {
-    // Give direct route ('fei') up to 900ms total head-start window if still in-flight
+    // Give the direct route up to 900ms total head-start window if still in-flight
     const directFast = await Promise.race([
       directPromise,
       new Promise((r) => setTimeout(() => r(null), 650)),
@@ -4146,7 +4288,12 @@ async function runRemoteCtl(host, action = 'ensure') {
 
   return new Promise((resolve, reject) => {
     const safeAction = ['ensure', 'restart', 'status'].includes(action) ? action : 'ensure';
-    const remoteCmd = `mkdir -p ~/.antigravity-server/bin && cat > ~/.antigravity-server/bin/.ag-remote-ctl.py.tmp.$$ && chmod 755 ~/.antigravity-server/bin/.ag-remote-ctl.py.tmp.$$ && mv -f ~/.antigravity-server/bin/.ag-remote-ctl.py.tmp.$$ ~/.antigravity-server/bin/ag-remote-ctl.py && AG_AUTH_PAYLOAD_B64='${payloadB64}' exec python3 ~/.antigravity-server/bin/ag-remote-ctl.py ${safeAction} ${appVersion} ${execId}`;
+    // Everything interpolated into the remote shell command must be inert.
+    const safeVersion = /^\d+\.\d+\.\d+$/.test(String(appVersion || '')) ? appVersion : '';
+    const safeExecId = /^(auto|\d+)$/.test(String(execId || '')) ? execId : 'auto';
+    // The OAuth payload goes over stdin (first line), not the command line: remote argv is
+    // world-readable via `ps`, a process environment is not.
+    const remoteCmd = `IFS= read -r AG_AUTH_PAYLOAD_B64; export AG_AUTH_PAYLOAD_B64; mkdir -p ~/.antigravity-server/bin && cat > ~/.antigravity-server/bin/.ag-remote-ctl.py.tmp.$$ && chmod 755 ~/.antigravity-server/bin/.ag-remote-ctl.py.tmp.$$ && mv -f ~/.antigravity-server/bin/.ag-remote-ctl.py.tmp.$$ ~/.antigravity-server/bin/ag-remote-ctl.py && exec python3 ~/.antigravity-server/bin/ag-remote-ctl.py ${safeAction} ${safeVersion} ${safeExecId}`;
     const proc = spawn('ssh', [...SSH_BASE_ARGS, ...SSH_MUX_ARGS, host, remoteCmd], {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -4180,6 +4327,7 @@ async function runRemoteCtl(host, action = 'ensure') {
       reject(err);
     });
 
+    proc.stdin.write(`${String(payloadB64).replace(/[\r\n]/g, '')}\n`);
     proc.stdin.write(remoteScript);
     proc.stdin.end();
   });
@@ -4262,61 +4410,19 @@ export async function discoverLocalMacLsPort() {
   });
 }
 
-function fetchBridgeStatus(bridgePort, timeoutMs = 2500) {
-  return new Promise((resolve) => {
-    const req = http.get(
-      {
-        hostname: '127.0.0.1',
-        port: bridgePort,
-        path: '/status',
-        agent: bridgeHttpAgent,
-        timeout: timeoutMs,
-      },
-      (res) => {
-        let body = '';
-        res.on('data', (d) => { body += d.toString(); });
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(body));
-          } catch {
-            resolve(null);
-          }
-        });
-      }
-    );
-    req.on('timeout', () => {
-      req.destroy();
-      resolve(null);
-    });
-    req.on('error', () => resolve(null));
-  });
+// Exposed for tests/ only.
+export const __test = {
+  bridgeRequest: (...a) => bridgeRequest(...a),
+  pingBridge: (...a) => pingBridge(...a),
+};
+
+async function fetchBridgeStatus(bridgePort, timeoutMs = 2500) {
+  return parseBridgeJson(await bridgeRequest({port: bridgePort, path: '/status', deadlineMs: timeoutMs, control: true}));
 }
 
-function pingBridge(bridgePort, timeoutMs = 2500) {
-  return new Promise((resolve) => {
-    const t0 = Date.now();
-    const req = http.get(
-      {
-        hostname: '127.0.0.1',
-        port: bridgePort,
-        path: '/ping',
-        agent: bridgeHttpAgent,
-        timeout: timeoutMs,
-      },
-      (res) => {
-        let body = '';
-        res.on('data', (d) => { body += d.toString(); });
-        res.on('end', () => {
-          resolve({ok: res.statusCode === 200, latencyMs: Date.now() - t0});
-        });
-      }
-    );
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ok: false, latencyMs: Infinity});
-    });
-    req.on('error', () => resolve({ok: false, latencyMs: Infinity}));
-  });
+async function pingBridge(bridgePort, timeoutMs = 2500) {
+  const res = await bridgeRequest({port: bridgePort, path: '/ping', deadlineMs: timeoutMs, control: true});
+  return res && res.status === 200 ? {ok: true, latencyMs: res.ms} : {ok: false, latencyMs: Infinity};
 }
 
 export async function stopRemoteTunnel(nextMode = 'local') {
@@ -4398,7 +4504,7 @@ async function killStaleSshForwards() {
 
 export async function ensureRemoteTunnel(requestedMode = sshState.mode, options = {}) {
   const {forceRestart = false, forceReconnect = false} = options;
-  const targetMode = requestedMode || 'auto';
+  const targetMode = normalizeSshMode(requestedMode || 'auto');
   sshState.mode = targetMode;
 
   ensureLocalHttpsProxy();
@@ -4419,7 +4525,7 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
     mainTunnelProc &&
     mainTunnelProc.exitCode === null &&
     sshState.status === 'connected' &&
-    (targetMode === 'auto' || mainTunnelHost === targetMode)
+    (targetMode === 'auto' || mainTunnelHost === hostForMode(targetMode))
   ) {
     const ping = await pingBridge(sshState.localBridgePort, 2000);
     if (ping.ok) {
@@ -4440,7 +4546,7 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
 
       const establishOnHost = async (host, initialRtt = 0) => {
         warmupWwwCacheFromRemote(host).catch(() => {});
-        const isTunnelRoute = host.includes('tunnel');
+        const isTunnelRoute = host === routeHosts().tunnel;
         const tHttps = 58285;
         const lHttp = 58283;
         const lBridge = 58284;
@@ -4562,7 +4668,7 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
         established = await establishOnHost(best.host, best.latencyMs);
       } catch (primaryErr) {
         if (isStale()) return getSshState();
-        const altHost = best.host === 'fei' ? 'fei-tunnel' : 'fei';
+        const altHost = best.host === routeHosts().direct ? routeHosts().tunnel : routeHosts().direct;
         const altProbe = await probeHostRtt(altHost, 8500);
         sshState.routeLatencies[altHost] = altProbe.ok ? altProbe.latencyMs : null;
         if (altProbe.ok && !isStale()) {
@@ -4578,8 +4684,10 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
       if (host !== sshState.activeHost) lastRouteSwitchTs = Date.now();
       rttEwmaMs = 0;
       noteRtt(pingRtt);
+      lastHealthyTs = Date.now();
       logSsh(`SSH tunnel up via ${host} (rtt=${pingRtt}ms)`);
       sshState.csrfToken = remoteInfo.csrfToken || sshState.csrfToken;
+      remoteRelayProtocol = Number(remoteInfo.relay) || 0;
       if (pingRtt > 0) sshState.routeLatencies[host] = pingRtt;
       handleOpenUrls(remoteInfo.openUrls, host);
 
@@ -4609,9 +4717,12 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
         hasAuth: remoteInfo.hasAuth !== false,
         lastError: '',
       });
+      notifyRelayReconnected();
 
-      await pushMergedProjectListToBrowsers().catch(() => {});
-      await syncCliSummariesAndPushUpdates().catch(() => {});
+      // Do not hold connectingPromise open on these: they go over the (possibly slow) bridge,
+      // and the health poll skips every check while a connect is "in progress".
+      pushMergedProjectListToBrowsers().catch(() => {});
+      syncCliSummariesAndPushUpdates().catch(() => {});
       ensureCliSummariesWatcher();
       return getSshState();
     } catch (err) {
@@ -4646,6 +4757,7 @@ let lastRouteSwitchTs = 0;
 let sshLogger = null;
 const HEALTH_FAIL_BUDGET = 3;           // consecutive failed polls ...
 const HEALTH_FAIL_MIN_WINDOW_MS = 30000; // ... spanning at least this long
+const HEALTH_DEAD_MS = 75000;            // watchdog: reconnect after this long without a good ping
 const ROUTE_SWITCH_MIN_INTERVAL_MS = 120000;
 const DIRECT_GOOD_STREAK_REQUIRED = 3;
 
@@ -4674,6 +4786,20 @@ function reconnectTunnel(reason) {
 }
 
 export async function pollTunnelHealth() {
+  // Watchdog, independent of the poll itself: if no health ping has succeeded for
+  // HEALTH_DEAD_MS, reconnect even when a poll is still stuck in flight. Before this, a poll
+  // blocked behind bulk transfers left the health check blind for ~7 minutes.
+  if (
+    sshState.mode !== 'local' &&
+    sshState.status === 'connected' &&
+    !connectingPromise &&
+    lastHealthyTs &&
+    Date.now() - lastHealthyTs > HEALTH_DEAD_MS
+  ) {
+    const since = Math.round((Date.now() - lastHealthyTs) / 1000);
+    lastHealthyTs = Date.now(); // one reconnect per dead window
+    return reconnectTunnel(`no successful health ping for ${since}s (watchdog)`);
+  }
   if (healthPollInFlight) return getSshState();
   healthPollInFlight = true;
   try {
@@ -4683,9 +4809,18 @@ export async function pollTunnelHealth() {
   }
 }
 
+let localDiscoveryInFlight = false;
+
 async function pollTunnelHealthOnce() {
-  ensureLocalPatchedMainJs();
-  await discoverLocalMacLsPort();
+  // Local housekeeping must not delay the remote health ping (lsof has no timeout).
+  if (!localDiscoveryInFlight) {
+    localDiscoveryInFlight = true;
+    Promise.resolve()
+      .then(() => ensureLocalPatchedMainJs())
+      .then(() => discoverLocalMacLsPort())
+      .catch(() => {})
+      .finally(() => { localDiscoveryInFlight = false; });
+  }
   syncCliSummariesAndPushUpdates().catch(() => {});
   if (sshState.mode === 'local') return getSshState();
   if (connectingPromise) return getSshState();
@@ -4706,7 +4841,8 @@ async function pollTunnelHealthOnce() {
     noteRtt(ping.latencyMs);
     if (mainTunnelHost) sshState.routeLatencies[mainTunnelHost] = ping.latencyMs;
     const st = await fetchBridgeStatus(sshState.localBridgePort, adaptiveTimeout(4000));
-    if (st?.openUrls?.length) handleOpenUrls(st.openUrls, mainTunnelHost || sshState.activeHost || 'fei');
+    if (st) remoteRelayProtocol = Number(st.relay) || 0;
+    if (st?.openUrls?.length) handleOpenUrls(st.openUrls, mainTunnelHost || sshState.activeHost || routeHosts().direct);
     const desiredAppVersion = detectLocalAppVersion();
     if (
       st &&
@@ -4724,20 +4860,21 @@ async function pollTunnelHealthOnce() {
     // Auto mode on the relay: only move back to the direct route after it has been
     // consistently good for a while, and never more than once per ROUTE_SWITCH_MIN_INTERVAL_MS.
     // Each switch drops every live stream, so flapping is worse than staying on the relay.
-    if (sshState.mode === 'auto' && mainTunnelHost === 'fei-tunnel') {
-      probeHostRtt('fei', 2000).then((pFei) => {
-        sshState.routeLatencies.fei = pFei.ok ? pFei.latencyMs : null;
-        directGoodStreak = pFei.ok && pFei.latencyMs <= 500 ? directGoodStreak + 1 : 0;
+    const hosts = routeHosts();
+    if (sshState.mode === 'auto' && mainTunnelHost === hosts.tunnel) {
+      probeHostRtt(hosts.direct, 2000).then((pDirect) => {
+        sshState.routeLatencies[hosts.direct] = pDirect.ok ? pDirect.latencyMs : null;
+        directGoodStreak = pDirect.ok && pDirect.latencyMs <= 500 ? directGoodStreak + 1 : 0;
         if (
           directGoodStreak >= DIRECT_GOOD_STREAK_REQUIRED &&
           Date.now() - lastRouteSwitchTs >= ROUTE_SWITCH_MIN_INTERVAL_MS &&
           !connectingPromise &&
           sshState.mode === 'auto' &&
-          mainTunnelHost === 'fei-tunnel'
+          mainTunnelHost === hosts.tunnel
         ) {
           directGoodStreak = 0;
           lastRouteSwitchTs = Date.now();
-          reconnectTunnel(`direct route healthy again (${pFei.latencyMs}ms), leaving relay`).catch(() => {});
+          reconnectTunnel(`direct route healthy again (${pDirect.latencyMs}ms), leaving relay`).catch(() => {});
         }
       }).catch(() => {});
     } else {
@@ -4749,7 +4886,7 @@ async function pollTunnelHealthOnce() {
     }
     return emitState({
       status: 'connected',
-      activeHost: mainTunnelHost || sshState.activeHost || 'fei',
+      activeHost: mainTunnelHost || sshState.activeHost || routeHosts().direct,
       latencyMs: ping.latencyMs,
       remotePid: st?.pid || sshState.remotePid,
       csrfToken: st?.csrfToken || sshState.csrfToken,
@@ -4778,5 +4915,9 @@ export async function fetchRemoteConversationRaw(cascadeId, lastSig = '', afterI
   // A full (non-delta) fetch can be MBs; give it time to finish once instead of aborting
   // at 3s and re-downloading it on every poll.
   const isFull = !(afterIdx >= 0);
-  return fetchBridgeJson(pathStr, isFull ? adaptiveTimeout(20000, 45000) : adaptiveTimeout(5000));
+  // Full fetches can be MBs: bound the wait for the response head, then allow the body as
+  // long as it keeps moving.
+  return isFull
+    ? fetchBridgeJson(pathStr, adaptiveTimeout(20000, 45000), {bodyIdleMs: 20000})
+    : fetchBridgeJson(pathStr, adaptiveTimeout(5000));
 }

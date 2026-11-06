@@ -42,7 +42,10 @@
 
 #### 第一步：确认前置条件
 1. macOS 已安装 `/Applications/Antigravity.app` 与 Node.js（建议 v22+）。
-2. `~/.ssh/config` 中已配置好远程 Linux 免密登录主机别名（可在 [`src/ssh-remote.mjs`](src/ssh-remote.mjs) 中按需配置主路由与备用隧道 Host）。
+2. `~/.ssh/config` 中已配置好远程 Linux 免密登录主机别名。安装后在 `~/.antigravity-patch/config.json` 里填写两条线路对应的别名（也可用环境变量 `AG_SSH_DIRECT_HOST` / `AG_SSH_TUNNEL_HOST` 覆盖）：
+   ```json
+   "sshRoutes": {"direct": "<直连别名>", "tunnel": "<跳板隧道别名>"}
+   ```
 
 #### 第二步：一键安装并启动守护进程
 ```bash
@@ -58,7 +61,7 @@ cd agy-ssh-remote
 | :--- | :--- |
 | 查看当前运行状态 & SSH 路由延迟 | `node ~/.antigravity-patch/patchctl.mjs status` |
 | 仅查看 SSH 隧道与远端服务状态 | `node ~/.antigravity-patch/patchctl.mjs ssh status` |
-| 切换 SSH 路由模式 (`auto` / 主路由 / 备用隧道 / `local`) | `node ~/.antigravity-patch/patchctl.mjs ssh auto` |
+| 切换 SSH 路由模式 (`auto` / `direct` / `tunnel` / `local`) | `node ~/.antigravity-patch/patchctl.mjs ssh auto` |
 | 重启远端 Linux 上的 `language_server` | `node ~/.antigravity-patch/patchctl.mjs ssh restart` |
 | 修改本仓库代码后重新部署 | `./install.sh`（或 `npm run deploy`） |
 
@@ -124,11 +127,17 @@ cd agy-ssh-remote
 ./install.sh
 ```
 
+Then set your two `~/.ssh/config` host aliases in `~/.antigravity-patch/config.json` (or via `AG_SSH_DIRECT_HOST` / `AG_SSH_TUNNEL_HOST`):
+
+```json
+"sshRoutes": {"direct": "<lan-or-tailscale-alias>", "tunnel": "<jump-host-alias>"}
+```
+
 ### Everyday CLI Commands
 
 | Action | Command |
 | :--- | :--- |
 | Check health status & SSH route latency | `node ~/.antigravity-patch/patchctl.mjs status` |
 | Check SSH tunnel & remote server status | `node ~/.antigravity-patch/patchctl.mjs ssh status` |
-| Switch SSH routing mode (`auto` / primary / tunnel / `local`) | `node ~/.antigravity-patch/patchctl.mjs ssh auto` |
+| Switch SSH routing mode (`auto` / `direct` / `tunnel` / `local`) | `node ~/.antigravity-patch/patchctl.mjs ssh auto` |
 | Force-restart remote Linux `language_server` | `node ~/.antigravity-patch/patchctl.mjs ssh restart` |

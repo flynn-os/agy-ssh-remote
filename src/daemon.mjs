@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {targets, connect, patchDir} from './cdp.mjs';
-import {readConfig, saveConfig, build, sshModes} from './bundle.mjs';
+import {readConfig, saveConfig, build} from './bundle.mjs';
+import {normalizeSshMode} from './routes.mjs';
 import {
   ensureRemoteTunnel,
   pollTunnelHealth,
@@ -248,14 +249,36 @@ function readLocalConversationMetrics(cascadeId) {
 // metrics pill alone could saturate the tunnel and starve the real history/stream traffic.
 const remoteMetricsBackoff = new Map(); // cascadeId -> { until, fails }
 
-async function readRemoteConversationMetrics(cascadeId) {
-  if (!cascadeId || !/^[0-9a-f-]{36}$/i.test(cascadeId)) return null;
+// One remote metrics fetch per conversation at a time, and at most one full (non-delta)
+// download overall. The UI asks for metrics every 1.5s until the first payload arrives; each
+// ask used to start another multi-MB download, which on a slow link filled every bridge socket.
+const remoteMetricsInFlight = new Map(); // cascadeId -> Promise
+let remoteFullMetricsFetches = 0;
+
+function readRemoteConversationMetrics(cascadeId) {
+  if (!cascadeId || !/^[0-9a-f-]{36}$/i.test(cascadeId)) return Promise.resolve(null);
+  const pending = remoteMetricsInFlight.get(cascadeId);
+  if (pending) return pending;
+  const p = readRemoteConversationMetricsOnce(cascadeId).finally(() => remoteMetricsInFlight.delete(cascadeId));
+  remoteMetricsInFlight.set(cascadeId, p);
+  return p;
+}
+
+async function readRemoteConversationMetricsOnce(cascadeId) {
   const cached = remoteMetricsCache.get(cascadeId);
   const backoff = remoteMetricsBackoff.get(cascadeId);
   if (backoff && Date.now() < backoff.until) return cached?.payload || null;
   const prevParsedMap = cached?.parsedMap ? new Map(cached.parsedMap) : new Map();
   const maxPrevIdx = prevParsedMap.size > 1 ? Math.max(...prevParsedMap.keys()) - 1 : -1;
-  const raw = await fetchRemoteConversationRaw(cascadeId, cached?.sig || '', maxPrevIdx);
+  const isFull = !(maxPrevIdx >= 0);
+  if (isFull && remoteFullMetricsFetches >= 1) return cached?.payload || null;
+  if (isFull) remoteFullMetricsFetches += 1;
+  let raw;
+  try {
+    raw = await fetchRemoteConversationRaw(cascadeId, cached?.sig || '', maxPrevIdx);
+  } finally {
+    if (isFull) remoteFullMetricsFetches -= 1;
+  }
   if (!raw || raw.ok === false) {
     const fails = (backoff?.fails || 0) + 1;
     remoteMetricsBackoff.set(cascadeId, {fails, until: Date.now() + Math.min(60000, 2000 * 2 ** (fails - 1))});
@@ -435,7 +458,7 @@ async function handleSshAction(session, rawPayload) {
     }
 
     if (action === 'set-mode') {
-      const nextMode = sshModes.includes(req.mode) ? req.mode : 'auto';
+      const nextMode = normalizeSshMode(req.mode);
       if (config.sshMode !== nextMode) {
         await saveConfig({...config, sshMode: nextMode});
       }
@@ -456,8 +479,9 @@ async function handleSshAction(session, rawPayload) {
 
     if (action === 'connect-window') {
       await captureCurrentSessionPath(session);
-      const desiredMode = req.mode && sshModes.includes(req.mode) && req.mode !== 'local'
-        ? req.mode
+      const requested = req.mode ? normalizeSshMode(req.mode) : '';
+      const desiredMode = requested && requested !== 'local'
+        ? requested
         : (config.sshMode === 'local' ? 'auto' : config.sshMode);
       if (config.sshMode !== desiredMode) {
         await saveConfig({...config, sshMode: desiredMode});

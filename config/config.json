@@ -4,5 +4,9 @@
   "localize": true,
   "settingsGuard": true,
   "metrics": true,
-  "sshMode": "auto"
+  "sshMode": "auto",
+  "sshRoutes": {
+    "direct": "devbox",
+    "tunnel": "devbox-tunnel"
+  }
 }

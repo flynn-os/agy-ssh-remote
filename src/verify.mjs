@@ -6,6 +6,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {targets, connect, patchDir} from './cdp.mjs';
 import {probeSshHost, selectBestHost, readLocalAuthPayload, detectLocalAppVersion, resolveExecutionIdForVersion} from './ssh-remote.mjs';
+import {routeHosts} from './routes.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -406,25 +407,26 @@ try {
     /GIT_FOLDER$/.test(String(resolveFolderRes?.resourceType || ''))
   );
 
-  const [probeFei, probeTunnel] = await Promise.all([
-    probeSshHost('fei', 6),
-    probeSshHost('fei-tunnel', 9),
+  const hosts = routeHosts();
+  const [probeDirect, probeTunnel] = await Promise.all([
+    probeSshHost(hosts.direct, 6),
+    probeSshHost(hosts.tunnel, 9),
   ]);
 
-  // Verify selectBestHost('auto') fast failover when fei hangs/times out and fei-tunnel succeeds
+  // Verify selectBestHost('auto') fast failover when the direct route hangs and the tunnel succeeds
   const failoverT0 = Date.now();
   const mockFailoverRes = await selectBestHost('auto', async host => {
-    if (host === 'fei') {
+    if (host === hosts.direct) {
       await new Promise(r => setTimeout(r, 1800));
-      return {ok: false, host: 'fei', latencyMs: 1800, error: 'simulated timeout'};
+      return {ok: false, host, latencyMs: 1800, error: 'simulated timeout'};
     }
     await new Promise(r => setTimeout(r, 300));
-    return {ok: true, host: 'fei-tunnel', latencyMs: 300};
+    return {ok: true, host, latencyMs: 300};
   });
   const failoverElapsedMs = Date.now() - failoverT0;
   const autoFailoverFastOk = Boolean(
     mockFailoverRes?.ok &&
-    mockFailoverRes.host === 'fei-tunnel' &&
+    mockFailoverRes.host === hosts.tunnel &&
     failoverElapsedMs < 1700
   );
 
@@ -514,8 +516,8 @@ try {
       remoteLsVersion: bridgeStatusRes?.version || '',
       versionSyncOk: Boolean(bridgeStatusRes?.version && bridgeStatusRes.version === detectLocalAppVersion()),
       routes: {
-        fei: probeFei,
-        'fei-tunnel': probeTunnel,
+        direct: probeDirect,
+        tunnel: probeTunnel,
       },
     },
   };
@@ -577,8 +579,8 @@ try {
     && result.sshTunnel.remoteGitFolderResolvedOk
     && result.sshTunnel.autoFailoverFastOk
     && result.sshTunnel.authDecodeResilienceOk
-    && result.sshTunnel.routes.fei.ok
-    && result.sshTunnel.routes['fei-tunnel'].ok;
+    && result.sshTunnel.routes.direct.ok
+    && result.sshTunnel.routes.tunnel.ok;
 
   console.log(JSON.stringify(result, null, 2));
   await fs.writeFile(path.join(patchDir, 'backups/verification.json'), JSON.stringify({verifiedAt: new Date().toISOString(), ...result}, null, 2) + '\n', {mode: 0o600});

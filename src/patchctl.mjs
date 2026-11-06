@@ -5,6 +5,7 @@ import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {targets, connect, patchDir} from './cdp.mjs';
 import {readConfig, saveConfig, presets, sshModes} from './bundle.mjs';
+import {routeHosts, normalizeSshMode, roleForHost} from './routes.mjs';
 import {probeSshHost, discoverLocalMacLsPort} from './ssh-remote.mjs';
 
 const label = 'local.fei.antigravity-theme';
@@ -50,9 +51,10 @@ if (command === 'status') {
 } else if (command === 'ssh') {
   const sub = value || 'status';
   if (sub === 'status') {
-    const [pFei, pTunnel, localMacPort] = await Promise.all([
-      probeSshHost('fei', 6),
-      probeSshHost('fei-tunnel', 8),
+    const hosts = routeHosts();
+    const [pDirect, pTunnel, localMacPort] = await Promise.all([
+      probeSshHost(hosts.direct, 6),
+      probeSshHost(hosts.tunnel, 8),
       discoverLocalMacLsPort(),
     ]);
     const windows = [];
@@ -65,20 +67,22 @@ if (command === 'status') {
     console.log(JSON.stringify({
       sshMode: config.sshMode,
       localMacPort,
-      routes: {fei: pFei, 'fei-tunnel': pTunnel},
+      routes: {direct: pDirect, tunnel: pTunnel},
       windows,
     }, null, 2));
-  } else if (sshModes.includes(sub)) {
-    await saveConfig({...config, sshMode: sub});
+  } else if (sshModes.includes(sub) || roleForHost(sub)) {
+    const mode = normalizeSshMode(sub);
+    await saveConfig({...config, sshMode: mode});
     for (const target of await targets().catch(() => [])) {
       const client = await connect(target);
       try {
-        await client.evaluate(`window.__feiAGPatch?.sendSshAction?.({action: 'set-mode', mode: ${JSON.stringify(sub)}})`);
+        await client.evaluate(`window.__feiAGPatch?.sendSshAction?.({action: 'set-mode', mode: ${JSON.stringify(mode)}})`);
       } finally { client.close(); }
     }
-    console.log(`SSH mode set to: ${sub}`);
+    console.log(`SSH mode set to: ${mode}`);
   } else if (sub === 'connect') {
-    const mode = sshModes.includes(extra) && extra !== 'local' ? extra : (config.sshMode === 'local' ? 'auto' : config.sshMode);
+    const wanted = extra ? normalizeSshMode(extra) : '';
+    const mode = wanted && wanted !== 'local' ? wanted : (config.sshMode === 'local' ? 'auto' : config.sshMode);
     await saveConfig({...config, sshMode: mode});
     const found = await targets().catch(() => []);
     if (found[0]) {
@@ -107,10 +111,10 @@ if (command === 'status') {
     }
     console.log('Triggered remote language_server restart and tunnel reconnect.');
   } else {
-    console.error('Usage: node ~/.antigravity-patch/patchctl.mjs ssh <status|auto|fei|fei-tunnel|local|connect [mode]|switch-local|restart>');
+    console.error('Usage: node ~/.antigravity-patch/patchctl.mjs ssh <status|auto|direct|tunnel|local|connect [mode]|switch-local|restart>');
     process.exitCode = 1;
   }
 } else {
-  console.error('Usage: node ~/.antigravity-patch/patchctl.mjs status|enable|disable|preset <high-contrast|claude-desktop-purewhite|vintage-deep|native>|locale <zh|en>|ssh <status|auto|fei|fei-tunnel|local|connect|switch-local|restart>');
+  console.error('Usage: node ~/.antigravity-patch/patchctl.mjs status|enable|disable|preset <high-contrast|claude-desktop-purewhite|vintage-deep|native>|locale <zh|en>|ssh <status|auto|direct|tunnel|local|connect|switch-local|restart>');
   process.exitCode = 1;
 }

@@ -2,9 +2,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {patchDir} from './cdp.mjs';
+import {SSH_MODES, normalizeSshMode} from './routes.mjs';
 
 export const presets = ['high-contrast', 'claude-desktop-purewhite', 'vintage-deep', 'native'];
-export const sshModes = ['local', 'auto', 'fei', 'fei-tunnel'];
+export const sshModes = SSH_MODES;
 let fontCSS;
 let cachedBundle = null;
 let cachedBundleKey = '';
@@ -61,7 +62,7 @@ export async function readConfig() {
   const config = JSON.parse(await fs.readFile(cfgPath, 'utf8'));
   if (!presets.includes(config.preset) || typeof config.localize !== 'boolean' || typeof config.enabled !== 'boolean')
     throw Error('Invalid patch configuration');
-  if (!config.sshMode || !sshModes.includes(config.sshMode)) config.sshMode = 'auto';
+  config.sshMode = normalizeSshMode(config.sshMode);
 
   const userCfgPath = await resolveExistingPath('user/config.json', 'config/user/config.json');
   const userConfig = await readJsonOptional(userCfgPath, {});
