@@ -1,0 +1,1038 @@
+/* === chuanban-antigravity-theme-patch v5.0.0 core/theme.css (upstream b319dba) — Anthropic @font-face supplied by bundle.mjs as embedded woff2 === */
+:root, body, body[data-agy-font], body[data-agy-font="google-sans"], body[data-agy-font="inter"] {
+  --vscode-font-family: 'Anthropic Sans', 'Anthropic Sans Web', 'Anthropic Sans Web Text', 'anthropic-sans', 'Styrene B', 'Styrene', system-ui, -apple-system, BlinkMacSystemFont, 'Sarasa UI SC', '更纱黑体 UI SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif !important;
+  --editor-font-family: 'Anthropic Mono', 'Anthropic Mono Web', 'anthropic-mono', 'Sarasa Mono Slab SC', '等距更纱黑体 Slab SC', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, Consolas, monospace !important;
+  --font-sans: 'Anthropic Sans', 'Anthropic Sans Web', 'Anthropic Sans Web Text', 'anthropic-sans', 'Styrene B', 'Styrene', system-ui, -apple-system, BlinkMacSystemFont, 'Sarasa UI SC', '更纱黑体 UI SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif !important;
+  --font-mono: 'Anthropic Mono', 'Anthropic Mono Web', 'anthropic-mono', 'Sarasa Mono Slab SC', '等距更纱黑体 Slab SC', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, Consolas, monospace !important;
+  --default-font-family: var(--font-sans) !important;
+  --default-mono-font-family: var(--font-mono) !important;
+  /* 恢复标准字重级阶，对齐稳定版（彻底消除 Insiders 强制引入的 250/350/450 细字重缺陷） */
+  --font-weight-light: 300 !important;
+  --font-weight-normal: 400 !important;
+  --font-weight-medium: 500 !important;
+  --font-weight-semibold: 600 !important;
+  --font-weight-bold: 700 !important;
+  --font-weight-black: 900 !important;
+  --agy-gsf-bold-wght: 600 !important;
+}
+
+/* 基础全局字重与平滑度：保证无衬线体基底扎实、对齐稳定版 400 */
+body, body[data-agy-font], body[data-agy-font="google-sans"] {
+  font-weight: 400 !important;
+}
+
+/* 1. UI 控件与全局界面：Claude Anthropic Sans / 更纱 UI */
+html, body, body[data-agy-font], button, select, nav, header, aside {
+  font-family: var(--font-sans) !important;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 2. 对话正文与 Markdown 内容：Claude 标志性 Anthropic Serif 衬线 + 更纱粗衬线/黑体 */
+.select-text, .prose, .markdown, .md-divider-spacing, article, .select-text :is(p, li, blockquote, h1, h2, h3, h4, h5, h6, strong, em, span, div), .md-divider-spacing :is(p, li, blockquote, h1, h2, h3, h4, h5, h6) {
+  font-family: 'Anthropic Serif', 'Anthropic Serif Web', 'Anthropic Serif Web Text Light', 'anthropic-serif', 'Tiempos Text', 'Tiempos', Georgia, Cambria, 'Times New Roman', 'Sarasa Mono Slab SC', '等距更纱黑体 Slab SC', 'Sarasa Gothic SC', '更纱黑体 SC', 'PingFang SC', serif;
+  letter-spacing: -0.003em;
+}
+
+.select-text :is(p, li, blockquote) {
+  line-height: 1.62;
+}
+
+/* 3. 代码、终端、diff查看器、文件名、文件路径：Claude Anthropic Mono / Sarasa Mono */
+code, pre, kbd, samp, .font-mono, [class*="language-"], .monaco-editor, .xterm, pre *, [class*="group/file-title"], [class*="group/file-title"] *, [class*="file-title"], [class*="file-path"], [data-path], [data-file-path], .tabular-nums, .select-text :is(code, pre, kbd, samp, .font-mono) {
+  font-family: var(--font-mono) !important;
+}
+
+/* 4. 输入框编辑区：Codex 同款等距更纱黑体 SLAB (Sarasa Mono Slab SC) */
+div[contenteditable="true"], textarea, div[contenteditable="true"] :is(p, span, div), [data-composer], .ProseMirror, .ProseMirror :is(p, span) {
+  font-family: 'Sarasa Mono Slab SC', '等距更纱黑体 Slab SC', 'Anthropic Mono', ui-monospace, monospace !important;
+}
+
+/* 5. 配色版本 3: 复古深色 (absoulutely-chuanban) */
+html[data-ag-preset="absoulutely-chuanban"], html[data-ag-preset="vintage-deep"], html[data-ag-preset="absoulutely-chuanban"] body.theme-light, html[data-ag-preset="vintage-deep"] body.theme-light {
+  --background: #FBF9F5 !important;
+  --sidebar: #F1E8DC !important;
+  --sidebar-secondary: #E6DCCE !important;
+  --sidebar-muted: #E8DFD1 !important;
+  --sidebar-border: #E0D4C3 !important;
+  --vscode-sideBar-background: #F1E8DC !important;
+}
+
+html[data-ag-preset="absoulutely-chuanban"] .bg-sidebar, html[data-ag-preset="vintage-deep"] .bg-sidebar {
+  background-color: var(--sidebar) !important;
+}
+
+html[data-ag-preset="absoulutely-chuanban"] body, html[data-ag-preset="vintage-deep"] body, html[data-ag-preset="absoulutely-chuanban"] .bg-background, html[data-ag-preset="vintage-deep"] .bg-background {
+  background-color: var(--background) !important;
+}
+
+/* 6. 配色版本 2: ClaudeDesktop 净白 (claude-desktop-official / claude-desktop-purewhite) */
+html[data-ag-preset="claude-desktop-official"], html[data-ag-preset="claude-desktop-purewhite"], html[data-ag-preset="claude-desktop-official"] body.theme-light, html[data-ag-preset="claude-desktop-purewhite"] body.theme-light {
+  --background: #FCFCFB !important;
+  --foreground: #1F1E1D !important;
+  --sidebar: #FBFBF9 !important;
+  --sidebar-secondary: #EDECE9 !important;
+  --sidebar-muted: #F3F2EF !important;
+  --sidebar-border: #F0F0EE !important;
+  --vscode-sideBar-background: #FBFBF9 !important;
+  --card: color-mix(in srgb, #FBF9F5 70%, #ffffff) !important;
+  --card-border: color-mix(in srgb, #2C2B29 12%, color-mix(in srgb, #FBF9F5 70%, #ffffff)) !important;
+}
+
+html[data-ag-preset="claude-desktop-official"] .bg-sidebar, html[data-ag-preset="claude-desktop-purewhite"] .bg-sidebar {
+  background-color: var(--sidebar) !important;
+}
+
+html[data-ag-preset="claude-desktop-official"] body, html[data-ag-preset="claude-desktop-purewhite"] body, html[data-ag-preset="claude-desktop-official"] .bg-background, html[data-ag-preset="claude-desktop-purewhite"] .bg-background {
+  background-color: var(--background) !important;
+  color: var(--foreground) !important;
+}
+
+/* 7. 配色版本 1 (默认首选): 高对比版 (chuanban-warm-white / high-contrast) - 正文页面: 保持微暖亮白 #FCFCFB - 左边栏: 介于白色和原正文底色之间的暖白燕麦色 #F7F5F0 - 输入框: 保持白色但比正文略深一点点、带有一点接近暖棕的颜色 #F9F7F2 - 高对比强化: * 按钮主轮廓线 (新建对话、历史对话): 边框从浅淡灰提升为高清晰度对比线 * 竖线中缝 (正文与左栏右栏间): 从淡灰透明提升为清晰实线 * 输入框下方的模型名称、Turbo模式、图标等: 从浅灰提升为近乎纯黑深墨色 (#0A0A0A) */
+html[data-ag-preset="chuanban-warm-white"], html[data-ag-preset="high-contrast"], html[data-ag-preset="chuanban-warm-white"] body.theme-light, html[data-ag-preset="high-contrast"] body.theme-light {
+  --background: #FCFCFB !important;
+  --foreground: #1F1E1D !important;
+  --sidebar: #F7F5F0 !important;
+  --sidebar-secondary: #ECE9E1 !important;
+  --sidebar-muted: #F2EFE7 !important;
+  --sidebar-border: rgba(0, 0, 0, 0.35) !important;
+  --border: rgba(0, 0, 0, 0.38) !important;
+  --vscode-sideBar-background: #F7F5F0 !important;
+  --card: #FFFFFF !important;
+  --card-border: rgba(0, 0, 0, 0.35) !important;
+  --card-edge: rgba(0, 0, 0, 0.35) !important;
+  --sash-line: rgba(0, 0, 0, 0.35) !important;
+  --secondary-foreground: #0A0A0A !important;
+  --muted-foreground: #1A1A1A !important;
+}
+
+html[data-ag-preset="chuanban-warm-white"] .bg-sidebar, html[data-ag-preset="high-contrast"] .bg-sidebar {
+  background-color: var(--sidebar) !important;
+}
+
+html[data-ag-preset="chuanban-warm-white"] body, html[data-ag-preset="high-contrast"] body, html[data-ag-preset="chuanban-warm-white"] .bg-background, html[data-ag-preset="high-contrast"] .bg-background {
+  background-color: var(--background) !important;
+  color: var(--foreground) !important;
+}
+
+/* 7.5 右侧交互页面外框线：对齐稳定版高清晰度黑度 (rgba(0, 0, 0, 0.35)) */
+.agy-inset-shell {
+  --card-edge: rgba(0, 0, 0, 0.35) !important;
+  --sash-line: rgba(0, 0, 0, 0.35) !important;
+}
+
+.agy-sheet[data-sheet-inset] [data-main-content-body]::after, .agy-inset-shell [data-side-panel-body]::after, [data-main-content-body]::after {
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35) !important;
+}
+
+/* 侧栏与主交互页面中缝分割线对齐稳定版 */
+.relative.flex.w-full.h-full.outline-none > div.flex-shrink-0.relative.z-30.w-[1px] {
+  background-color: rgba(0, 0, 0, 0.35) !important;
+}
+
+/* 输入框外层容器：分场景动态三形态（设计 A / B / C，宽度严格锁定 1.5px 杜绝抖动） */
+html[data-ag-preset] #antigravity\.agentSidePanelInputBox, html[data-ag-preset] [id="antigravity.agentSidePanelInputBox"], #antigravity\.agentSidePanelInputBox, [id="antigravity.agentSidePanelInputBox"], .surface-composer.bg-card-border {
+  background-color: #F7EFE6 !important;
+  outline: none !important;
+  transition: border-color 220ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 220ms cubic-bezier(0.16, 1, 0.3, 1) !important;
+}
+
+/* ---------------------------------------------------------------------- * 【场景 2：首页 / 空白新建对话场景】 * 判定依据（组件级纯 CSS :has() 0ms 瞬时响应 + html[data-ag-page-type="home"] 零重算兜底）： * 1. 输入框组件自身含分支选择器 [data-testid="branch-pill-trigger"] 或项目选择器头部 * 2. 或 html 根节点标记 [data-ag-page-type="home"] * ---------------------------------------------------------------------- */
+/* 2.1 新建对话日常常态：设计 C (外框完全透明，无阴影，融于背景) */
+#antigravity\.agentSidePanelInputBox:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]), [id="antigravity.agentSidePanelInputBox"]:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]), .surface-composer.bg-card-border:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]), html[data-ag-page-type="home"] #antigravity\.agentSidePanelInputBox, html[data-ag-page-type="home"] [id="antigravity.agentSidePanelInputBox"], html[data-ag-page-type="home"] .surface-composer.bg-card-border {
+  border: 1.5px solid transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+/* 2.2 新建对话鼠标移上 / 聚焦：变成为设计 A (略粗一点颜色偏淡蜡封暗红，微阴影) */
+#antigravity\.agentSidePanelInputBox:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]):hover, [id="antigravity.agentSidePanelInputBox"]:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]):hover, .surface-composer.bg-card-border:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]):hover, #antigravity\.agentSidePanelInputBox:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]):focus-within, [id="antigravity.agentSidePanelInputBox"]:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]):focus-within, .surface-composer.bg-card-border:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]):focus-within, html[data-ag-page-type="home"] #antigravity\.agentSidePanelInputBox:hover, html[data-ag-page-type="home"] [id="antigravity.agentSidePanelInputBox"]:hover, html[data-ag-page-type="home"] .surface-composer.bg-card-border:hover, html[data-ag-page-type="home"] #antigravity\.agentSidePanelInputBox:focus-within, html[data-ag-page-type="home"] [id="antigravity.agentSidePanelInputBox"]:focus-within, html[data-ag-page-type="home"] .surface-composer.bg-card-border:focus-within {
+  border: 1.5px solid rgba(116, 34, 26, 0.36) !important;
+  border-color: rgba(116, 34, 26, 0.36) !important;
+  box-shadow: 0 1px 3px rgba(116, 34, 26, 0.04) !important;
+}
+
+/* ---------------------------------------------------------------------- * 【场景 1：日常推进具体聊天会话页面】（严格限定非新建态：排斥 branch-pill-trigger、项目头部与 home） * ---------------------------------------------------------------------- */
+/* 1.1 具体会话日常常态：设计 A (略粗一点颜色偏淡蜡封暗红) */
+html:not([data-ag-page-type="home"]) #antigravity\.agentSidePanelInputBox:not(:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"])), html:not([data-ag-page-type="home"]) [id="antigravity.agentSidePanelInputBox"]:not(:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"])), html:not([data-ag-page-type="home"]) .surface-composer.bg-card-border:not(:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"])) {
+  border: 1.5px solid rgba(116, 34, 26, 0.36) !important;
+  border-color: rgba(116, 34, 26, 0.36) !important;
+  box-shadow: 0 1px 3px rgba(116, 34, 26, 0.03) !important;
+}
+
+/* 1.2 具体会话移上 / 聚焦：变成为设计 B (加深变浓实色蜡封暗红，支持 --ag-wax-seal-hover 覆盖) */
+html:not([data-ag-page-type="home"]) #antigravity\.agentSidePanelInputBox:not(:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"])):hover, html:not([data-ag-page-type="home"]) [id="antigravity.agentSidePanelInputBox"]:not(:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"])):hover, html:not([data-ag-page-type="home"]) .surface-composer.bg-card-border:not(:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"])):hover, html:not([data-ag-page-type="home"]) #antigravity\.agentSidePanelInputBox:not(:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"])):focus-within, html:not([data-ag-page-type="home"]) [id="antigravity.agentSidePanelInputBox"]:not(:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"])):focus-within, html:not([data-ag-page-type="home"]) .surface-composer.bg-card-border:not(:has([data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"])):focus-within {
+  border: 1.5px solid var(--ag-wax-seal-hover, #74221A) !important;
+  border-color: var(--ag-wax-seal-hover, #74221A) !important;
+  box-shadow: 0 1px 4px rgba(116, 34, 26, 0.12) !important;
+}
+
+/* 上方工具栏文字与小按钮（No Project 及其箭头） */
+[id="antigravity.agentSidePanelInputBox"] > div:first-child button, [id="antigravity.agentSidePanelInputBox"] > div:first-child span, [id="antigravity.agentSidePanelInputBox"] > div:first-child svg {
+  color: #383431 !important;
+}
+
+[id="antigravity.agentSidePanelInputBox"] > div:first-child button:hover {
+  background-color: rgba(217, 119, 87, 0.08) !important;
+  color: #1F1E1D !important;
+}
+
+/* 方案2：内部打字卡片无边框，获得焦点 (:focus-within) 时微浮雕拟物平滑抬升 */
+.surface-composer-card.bg-card, [id="antigravity.agentSidePanelInputBox"] .surface-composer-card, [id="antigravity.agentSidePanelInputBox"] > div.bg-card {
+  background-color: #FFFFFF !important;
+  border: 1px solid transparent !important;
+  border-color: transparent !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02) !important;
+  outline: none !important;
+  transition: box-shadow 250ms cubic-bezier(0.16, 1, 0.3, 1) !important;
+}
+
+.surface-composer:focus-within > .surface-composer-card, .surface-composer-card:focus-within, [id="antigravity.agentSidePanelInputBox"]:focus-within .surface-composer-card {
+  box-shadow: 0 6px 20px -2px rgba(60, 20, 15, 0.07), 0 2px 6px -1px rgba(0, 0, 0, 0.04) !important;
+}
+
+/* 搜索栏聚焦优化（消除双层同心圈）：激活时外圈橙色轮廓彻底隐去，原位内圈灰线直接平滑切换为品牌橙色粗线 (方案三) */
+input[placeholder*="Search"], input[class*="focus:border-ring"] {
+  --nux-focus-ring: transparent !important;
+}
+
+input[placeholder*="Search"]:focus, input[placeholder*="Search"]:focus-visible, input[class*="focus:border-ring"]:focus, input[class*="focus:border-ring"]:focus-visible {
+  outline: none !important;
+  outline-offset: 0 !important;
+  border-color: #D97757 !important;
+  box-shadow: 0 0 0 1px #D97757 !important;
+}
+
+/* 高对比主轮廓线：新建对话、历史对话及操作胶囊 */
+html[data-ag-preset="chuanban-warm-white"] a[class*="inline-flex items-center"], html[data-ag-preset="high-contrast"] a[class*="inline-flex items-center"], html[data-ag-preset="chuanban-warm-white"] .bg-sidebar a, html[data-ag-preset="high-contrast"] .bg-sidebar a, html[data-ag-preset="chuanban-warm-white"] .bg-sidebar button, html[data-ag-preset="high-contrast"] .bg-sidebar button {
+  border-color: rgba(0, 0, 0, 0.32) !important;
+}
+
+/* 高对比竖线中缝：正文与左右栏边界 */
+html[data-ag-preset="chuanban-warm-white"] .bg-border, html[data-ag-preset="high-contrast"] .bg-border {
+  background-color: rgba(0, 0, 0, 0.28) !important;
+}
+
+/* 高对比输入框底部：模型名称、Turbo模式、图标字体深色近乎纯黑 */
+html[data-ag-preset="chuanban-warm-white"] #antigravity\.agentSidePanelInputBox [class*="text-secondary-foreground"], html[data-ag-preset="high-contrast"] #antigravity\.agentSidePanelInputBox [class*="text-secondary-foreground"], html[data-ag-preset="chuanban-warm-white"] #antigravity\.agentSidePanelInputBox button:not([data-testid="send-button"]):not([data-testid="voice-start-button"]), html[data-ag-preset="high-contrast"] #antigravity\.agentSidePanelInputBox button:not([data-testid="send-button"]):not([data-testid="voice-start-button"]), html[data-ag-preset="chuanban-warm-white"] #antigravity\.agentSidePanelInputBox span:not([data-testid="voice-live-pill"]):not([data-testid="voice-live-pill"] *), html[data-ag-preset="high-contrast"] #antigravity\.agentSidePanelInputBox span:not([data-testid="voice-live-pill"]):not([data-testid="voice-live-pill"] *), html[data-ag-preset="chuanban-warm-white"] #antigravity\.agentSidePanelInputBox svg:not([data-testid="voice-live-pill"] *):not([data-testid="send-button"] *), html[data-ag-preset="high-contrast"] #antigravity\.agentSidePanelInputBox svg:not([data-testid="voice-live-pill"] *):not([data-testid="send-button"] *) {
+  color: #0A0A0A !important;
+  opacity: 1 !important;
+}
+
+/* 发送按钮与操作胶囊：Claude 陶土暖橙与暗金质感 (#D97757)，高对比纯白图标 */
+html[data-ag-preset] #antigravity\.agentSidePanelInputBox [data-testid="voice-live-pill"], html[data-ag-preset] #antigravity\.agentSidePanelInputBox button[data-testid="send-button"], html[data-ag-preset] #antigravity\.agentSidePanelInputBox .agy-send-button, [data-testid="voice-live-pill"], button[data-testid="send-button"], .agy-send-button {
+  background-color: #D97757 !important;
+  color: #FFFFFF !important;
+  border: 1px solid #C45F40 !important;
+  box-shadow: 0 1px 2px rgba(217, 119, 87, 0.25) !important;
+}
+
+html[data-ag-preset] #antigravity\.agentSidePanelInputBox [data-testid="voice-live-pill"]:hover, html[data-ag-preset] #antigravity\.agentSidePanelInputBox button[data-testid="send-button"]:hover, html[data-ag-preset] #antigravity\.agentSidePanelInputBox .agy-send-button:hover, [data-testid="voice-live-pill"]:hover, button[data-testid="send-button"]:hover, .agy-send-button:hover {
+  background-color: #C86646 !important;
+  opacity: 1 !important;
+}
+
+html[data-ag-preset] #antigravity\.agentSidePanelInputBox [data-testid="voice-live-pill"] *, html[data-ag-preset] #antigravity\.agentSidePanelInputBox button[data-testid="send-button"] *, html[data-ag-preset] #antigravity\.agentSidePanelInputBox .agy-send-button * {
+  color: #FFFFFF !important;
+  fill: #FFFFFF !important;
+}
+
+/* 严格保护 voice-live-pill 内部状态显隐 (消除默认态声波星芒与取消态 X 图标的双重重叠) */
+html[data-ag-preset] #antigravity\.agentSidePanelInputBox [data-testid="voice-live-pill"] .opacity-0, html[data-ag-preset] #antigravity\.agentSidePanelInputBox [data-testid="voice-live-pill"] [class*="opacity-0"], html[data-ag-preset] #antigravity\.agentSidePanelInputBox [data-testid="voice-live-pill"] [class*="opacity-0"] *, [data-testid="voice-live-pill"] .opacity-0, [data-testid="voice-live-pill"] [class*="opacity-0"], [data-testid="voice-live-pill"] [class*="opacity-0"] * {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  display: none !important;
+}
+
+html[data-ag-preset] #antigravity\.agentSidePanelInputBox [data-testid="voice-live-pill"] .opacity-100, html[data-ag-preset] #antigravity\.agentSidePanelInputBox [data-testid="voice-live-pill"] [class*="opacity-100"], [data-testid="voice-live-pill"] .opacity-100, [data-testid="voice-live-pill"] [class*="opacity-100"] {
+  opacity: 1 !important;
+  visibility: visible !important;
+  display: flex !important;
+}
+
+/* 8. 界面排版扎实度与温润墨感增强（保留更纱黑体不变，通过 --ag-ink-shadow-* 变量 O(1) 兼容 Windows ClearType） */
+/* 侧边栏常规列表：字重450微收敛、微负字距凝聚、深暖炭墨色、0.2px微润墨柔化硬切角 */
+.bg-sidebar a, .bg-sidebar button, .bg-sidebar [class*="truncate"], .bg-sidebar [class*="text-sm"], .bg-sidebar [class*="text-xs"], aside a, aside button {
+  font-weight: 450 !important;
+  letter-spacing: -0.012em !important;
+  color: #262422 !important;
+  text-rendering: optimizeLegibility;
+  text-shadow: var(--ag-ink-shadow-sm);
+}
+
+/* 侧边栏任务清单/对话列表标题：微量减轻一个层级至 400，消除墨晕阴影，西文恢复清爽秀气 */
+[data-testid="conversation-row-sidebar"]:not([data-selected="true"]) span.truncate, .bg-sidebar [data-testid="conversation-row-sidebar"]:not([data-selected="true"]) [class*="truncate"], .agy-sidebar-row:not([data-selected="true"]) span.truncate, aside [data-testid="conversation-row-sidebar"]:not([data-selected="true"]) span {
+  font-weight: 400 !important;
+  letter-spacing: -0.005em !important;
+  color: #262422 !important;
+  text-shadow: none !important;
+}
+
+/* 项目目录文件夹标题 (Root / Storydesk 等展开按钮及子标签)：轻削粗度与墨晕，避免误伤 */
+button[data-testid="project-header"], button[data-project-card="true"], [data-project-label], [data-subtext] span[class*="text-muted"], span:has(> svg) + span {
+  font-weight: 450 !important;
+  color: #383533 !important;
+  text-shadow: var(--ag-ink-shadow-xs) !important;
+}
+
+button[data-testid="project-header"] span, button[data-project-card="true"] span {
+  font-weight: 450 !important;
+  color: #2C2B29 !important;
+  text-shadow: var(--ag-ink-shadow-xs) !important;
+  letter-spacing: -0.01em !important;
+}
+
+/* 侧栏选中态与激活项：精准限定激活对话，深墨纯黑、轮廓扎实 */
+[data-testid="conversation-row-sidebar"][data-selected="true"], [data-testid="conversation-row-sidebar"][data-selected="true"] span, .bg-sidebar [data-testid="conversation-row-sidebar"][data-selected="true"] [class*="truncate"], .bg-sidebar [data-active="true"], .bg-sidebar [data-active="true"] span, .bg-sidebar [aria-selected="true"] {
+  font-weight: 520 !important;
+  color: #0A0A0A !important;
+  text-shadow: var(--ag-ink-shadow-md) !important;
+}
+
+/* 侧栏分类小标题（如置顶对话、项目管理） */
+.bg-sidebar [class*="text-muted"], .bg-sidebar [class*="text-[11px]"], .bg-sidebar [class*="uppercase"] {
+  font-weight: 500 !important;
+  letter-spacing: -0.005em !important;
+  color: #7A7670 !important;
+}
+
+/* 界面按钮与全局操作控件：微负字距增加紧实感 */
+button, [role="button"], select {
+  letter-spacing: -0.012em;
+}
+
+/* 输入框底部模型控制栏：深墨色与扎实字重 */
+#antigravity\.agentSidePanelInputBox [class*="text-secondary-foreground"], #antigravity\.agentSidePanelInputBox button, #antigravity\.agentSidePanelInputBox span {
+  font-weight: 500 !important;
+  letter-spacing: -0.012em !important;
+  text-shadow: var(--ag-ink-shadow-md);
+}
+
+/* 8.5 菜单、弹出层与设置项目字重全面对齐稳定版 (Solid Ink Optimization) */
+[role="menu"], [role="menuitem"], .agy-overlay, .agy-overlay-item, [data-radix-menu-content], [data-radix-popper-content-wrapper], [data-side] {
+  font-family: var(--font-sans) !important;
+}
+
+/* 下拉菜单项、二级子菜单项（如 View Usage / 子项）与模型名称：扎实字重与微字距 */
+[role="menu"] [role="menuitem"], [role="menu"] .agy-overlay-item, .agy-overlay .agy-overlay-item, [role="menu"] [class*="truncate"], [role="menu"] [class*="text-xs"], [role="menu"] [class*="text-[13px]"], [role="menu"] span {
+  font-weight: 400 !important;
+  letter-spacing: -0.01em !important;
+  color: #1F1E1D !important;
+}
+
+/* 菜单主项目、动作按钮与模型名称统一扎实字重 450（彻底统一 View Usage、Main Agent、各模型名称等） */
+[role="menu"] [role="menuitem"] > span, [role="menu"] [role="menuitem"] span[class*="flex-1"], [role="menu"] [role="menuitem"] span.truncate, [role="menu"] .agy-overlay-item > span, [role="menu"] .agy-overlay-item span[class*="flex-1"], [role="menu"] .agy-overlay-item span.truncate, .agy-overlay .agy-overlay-item > span, .agy-overlay .agy-overlay-item span[class*="flex-1"], .agy-overlay .agy-overlay-item span.truncate {
+  font-weight: 450 !important;
+  letter-spacing: -0.01em !important;
+  color: #1F1E1D !important;
+}
+
+/* 菜单与弹窗小标题、头部（如 "Model", "Usage", "Gemini 模型", "Claude 与 GPT 模型"） */
+[role="menu"] [class*="font-medium"], [role="menu"] [class*="text-muted-foreground"], [role="menu"] h2, [role="menu"] h3, [role="menu"] h4, .agy-overlay [class*="font-medium"], .agy-overlay [class*="text-muted-foreground"] {
+  font-weight: 500 !important;
+  letter-spacing: -0.01em !important;
+  color: #1A1A1A !important;
+}
+
+/* 系统设置主菜单右侧二级菜单/配置卡片项目 (Settings Dialog Items) */
+[role="dialog"] {
+  font-family: var(--font-sans) !important;
+}
+
+[role="dialog"] h2, [role="dialog"] h3 {
+  font-weight: 500 !important;
+  letter-spacing: -0.01em !important;
+  color: #1F1E1D !important;
+}
+
+[role="dialog"] .agy-card span.text-sm, [role="dialog"] [class*="agy-card"] span.text-sm, [role="dialog"] [class*="divide-border"] span.text-sm {
+  font-weight: 450 !important;
+  letter-spacing: -0.01em !important;
+  color: #1F1E1D !important;
+  text-shadow: var(--ag-ink-shadow-xs) !important;
+}
+
+/* 9. 模型名称同行实时指标胶囊 (TPS / TTFT / Ctx 256k / Out) 布局铁律： - 常态 (data-ag-row-mode="middle")：严格处于「左：+ 与模型选择」和「右：模式选择与发送按钮」正中间，随宽度自动 ellipsis 缩略； - 极窄 (data-ag-row-mode="bottom")：当中间可用宽度 < 150px (损失过多信息) 时，物理挂载至 bottomRow 正下方作为独立第二行，绝不改变第一行左右布局。 */
+#antigravity\.agentSidePanelInputBox div[data-ag-row-mode="middle"] > div:first-child,
+#antigravity\.agentSidePanelInputBox div[data-ag-row-mode="bottom"] > div:first-child {
+  overflow: hidden !important;
+  min-width: 0 !important;
+}
+
+#antigravity\.agentSidePanelInputBox div[data-ag-row-mode="middle"] > div:first-child > *:not(#ag-live-metrics-pill),
+#antigravity\.agentSidePanelInputBox div[data-ag-row-mode="bottom"] > div:first-child > *:not(#ag-live-metrics-pill) {
+  flex-shrink: 0 !important;
+}
+
+#antigravity\.agentSidePanelInputBox div[data-ag-row-mode="middle"] > div:last-child,
+#antigravity\.agentSidePanelInputBox div[data-ag-row-mode="bottom"] > div:last-child {
+  flex-shrink: 0 !important;
+  margin-left: auto !important;
+}
+
+#ag-live-metrics-pill {
+  position: relative;
+  display: none;
+  align-items: center;
+  flex: 1 1 0% !important;
+  max-width: max-content !important;
+  min-width: 0 !important;
+  height: 22px;
+  margin-left: 6px;
+  margin-right: 4px;
+  padding: 0 4px 0 8px;
+  border-left: 1px solid rgba(0, 0, 0, 0.22);
+  font-family: var(--font-mono) !important;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  letter-spacing: -0.02em !important;
+  color: #262422 !important;
+  opacity: 0.92 !important;
+  line-height: 1 !important;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+  cursor: default;
+}
+
+#ag-live-metrics-pill:hover {
+  opacity: 1 !important;
+  color: #0A0A0A !important;
+}
+
+#ag-live-metrics-pill[data-ag-row-mode="bottom"],
+#ag-live-metrics-pill.ag-pill-wrapped {
+  flex: 0 0 100% !important;
+  width: calc(100% - 8px) !important;
+  max-width: calc(100% - 8px) !important;
+  height: 20px !important;
+  margin: 2px 4px 2px 4px !important;
+  padding: 2px 4px 0 6px !important;
+  border-left: none !important;
+  border-top: 1px dashed rgba(0, 0, 0, 0.14) !important;
+}
+
+#ag-live-metrics-pill #ag-live-metrics-text,
+#ag-live-metrics-pill .ag-m-item {
+  font-family: var(--font-mono) !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  letter-spacing: -0.02em !important;
+  color: inherit !important;
+}
+
+#ag-live-metrics-pill:hover #ag-live-metrics-text {
+  opacity: 1 !important;
+  color: #0A0A0A !important;
+}
+
+#ag-live-metrics-pill .ag-sep,
+#ag-live-metrics-pill .ag-m-sep {
+  margin: 0 3.5px;
+  opacity: 0.45 !important;
+}
+
+#ag-live-metrics-pill .ag-ctx-warn,
+#ag-live-metrics-pill[data-ctx-warn="high"] .ag-m-ctx {
+  color: #B45309 !important;
+  font-weight: 600 !important;
+}
+
+#ag-live-metrics-pill .ag-ctx-crit,
+#ag-live-metrics-pill[data-ctx-warn="crit"] .ag-m-ctx {
+  color: #DC2626 !important;
+  font-weight: 700 !important;
+}
+
+#ag-live-metrics-tooltip {
+  position: fixed;
+  z-index: 2147483647;
+  min-width: 340px;
+  max-width: 450px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background-color: var(--card, #F9F7F2) !important;
+  border: 1px solid var(--card-border, rgba(0, 0, 0, 0.35)) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16), 0 2px 6px rgba(0, 0, 0, 0.08);
+  font-family: var(--font-mono) !important;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px !important;
+  line-height: 1.55 !important;
+  color: var(--foreground, #1F1E1D) !important;
+  text-align: left;
+  white-space: normal;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(4px);
+  transition: opacity 0.12s ease, transform 0.12s ease, visibility 0.12s;
+}
+
+#ag-live-metrics-tooltip[data-visible="1"],
+#ag-live-metrics-tooltip.ag-tt-visible {
+  opacity: 1 !important;
+  visibility: visible !important;
+  transform: translateY(0);
+}
+
+#ag-live-metrics-tooltip .ag-tt-hdr,
+#ag-live-metrics-tooltip .ag-tt-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600 !important;
+  font-size: 11px !important;
+  color: #0A0A0A !important;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.14);
+  padding-bottom: 4px;
+  margin-bottom: 6px;
+}
+
+#ag-live-metrics-tooltip .ag-tt-sec {
+  margin-top: 8px;
+}
+
+#ag-live-metrics-tooltip .ag-tt-div {
+  height: 1px;
+  background: rgba(0, 0, 0, 0.1);
+  margin: 6px 0;
+}
+
+#ag-live-metrics-tooltip .ag-tt-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px !important;
+  font-weight: 450 !important;
+}
+
+#ag-live-metrics-tooltip .ag-tt-lbl,
+#ag-live-metrics-tooltip .ag-tt-label {
+  color: #57534E !important;
+  flex-shrink: 0;
+}
+
+#ag-live-metrics-tooltip .ag-tt-val {
+  color: #0A0A0A !important;
+  font-weight: 500 !important;
+  text-align: right;
+}
+
+#ag-live-metrics-tooltip .ag-tt-accent {
+  color: #7A1F1A !important;
+  font-weight: 600 !important;
+}
+
+/* === v5.0.0 User Theme Variables, Windows ClearType & Feature Switches === */
+:root {
+  --ag-chat-font-size: 16px;
+  --ag-wax-seal-hover: #74221A;
+  --ag-ink-shadow-xs: 0 0 0.15px rgba(38, 36, 34, 0.25);
+  --ag-ink-shadow-sm: 0 0 0.2px rgba(38, 36, 34, 0.35);
+  --ag-ink-shadow-md: 0 0 0.25px rgba(10, 10, 10, 0.4);
+}
+
+/* Windows ClearType 亚像素抗锯齿适配：O(1) 根变量级移除微墨晕 text-shadow 防止低分屏发毛，杜绝通配符 * 遍历 */
+html[data-ag-os="win32"] {
+  --ag-ink-shadow-xs: none;
+  --ag-ink-shadow-sm: none;
+  --ag-ink-shadow-md: none;
+}
+
+html[data-ag-custom-font-size="true"] .prose,
+html[data-ag-custom-font-size="true"] .markdown,
+html[data-ag-custom-font-size="true"] [class*="chat-message"] {
+  font-size: var(--ag-chat-font-size) !important;
+}
+
+html[data-ag-wax-seal="off"] #antigravity\.agentSidePanelInputBox,
+html[data-ag-wax-seal="off"] [id="antigravity.agentSidePanelInputBox"] {
+  border-width: 1px !important;
+  border-color: rgba(31, 30, 29, 0.15) !important;
+  box-shadow: none !important;
+}
+
+
+/* === Local SSH workspace UI (antigravity-ssh-patch) === */
+/* §5.6 SSH 远程工作区侧边栏切换器卡片 */
+#ag-ssh-sidebar-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border, rgba(0, 0, 0, 0.12));
+  background: var(--card, rgba(255, 255, 255, 0.75));
+  font: 12px var(--ag-ui, system-ui);
+  color: var(--foreground);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+#ag-ssh-sidebar-card[data-remote="1"] {
+  border-color: rgba(22, 163, 74, 0.42);
+  background: rgba(22, 163, 74, 0.05);
+}
+
+#ag-ssh-sidebar-card .ag-ssh-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+#ag-ssh-sidebar-card .ag-ssh-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#ag-ssh-sidebar-card .ag-ssh-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #9CA3AF;
+}
+
+#ag-ssh-sidebar-card .ag-ssh-dot.is-remote-ok {
+  background: #16A34A;
+  box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.22);
+}
+
+#ag-ssh-sidebar-card .ag-ssh-dot.is-tunnel-ready {
+  background: #2563EB;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18);
+}
+
+#ag-ssh-sidebar-card .ag-ssh-dot.is-warn {
+  background: #D97706;
+}
+
+#ag-ssh-sidebar-card .ag-ssh-badge {
+  font-family: var(--font-mono, monospace);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--secondary, rgba(0, 0, 0, 0.06));
+  color: var(--muted-foreground, #57534E);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+#ag-ssh-sidebar-card[data-remote="1"] .ag-ssh-badge,
+#ag-ssh-sidebar-card[data-status="connected"] .ag-ssh-badge {
+  background: rgba(22, 163, 74, 0.15);
+  color: #15803D;
+  font-weight: 600;
+}
+
+#ag-ssh-sidebar-card .ag-ssh-route-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#ag-ssh-sidebar-card .ag-ssh-route-lbl {
+  font-size: 11px;
+  color: var(--muted-foreground, #57534E);
+  flex-shrink: 0;
+}
+
+#ag-ssh-sidebar-card #ag-ssh-mode-select {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  font: 11.5px var(--ag-ui, system-ui);
+  border-radius: 5px;
+  border: 1px solid var(--border, rgba(0, 0, 0, 0.14));
+  background: var(--background, #FFFFFF);
+  color: var(--foreground);
+  cursor: pointer;
+}
+
+#ag-ssh-sidebar-card .ag-ssh-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ag-ssh-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font: 500 11.5px var(--ag-ui, system-ui);
+  border-radius: 5px;
+  border: 1px solid var(--border, rgba(0, 0, 0, 0.15));
+  background: var(--secondary, #F3F2EE);
+  color: var(--foreground);
+  cursor: pointer;
+  transition: filter 0.12s ease, background 0.12s ease;
+  white-space: nowrap;
+}
+
+.ag-ssh-btn:hover {
+  filter: brightness(0.95);
+}
+
+.ag-ssh-btn-primary {
+  flex: 1;
+  background: var(--primary, #141413);
+  color: var(--primary-foreground, #FFFFFF);
+  border-color: transparent;
+}
+
+#ag-ssh-sidebar-card[data-remote="1"] .ag-ssh-btn-primary {
+  background: #15803D;
+  color: #FFFFFF;
+}
+
+.ag-ssh-btn-secondary {
+  flex: 1;
+  padding: 4px 7px;
+}
+
+.ag-ssh-btn-icon {
+  padding: 4px 7px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+/* 环境筛选分段栏 (全部 / 本机 / 远程 SSH) */
+.ag-ssh-env-filter-bar {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 3px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--secondary, rgba(0, 0, 0, 0.05));
+  border: 1px solid var(--border, rgba(0, 0, 0, 0.08));
+}
+
+.ag-ssh-filter-pill {
+  padding: 3px 4px;
+  font: 500 11px var(--ag-ui, system-ui);
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--muted-foreground, #57534E);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.ag-ssh-filter-pill:hover {
+  color: var(--foreground);
+}
+
+.ag-ssh-filter-pill.is-active {
+  background: var(--background, #FFFFFF);
+  color: var(--foreground, #141413);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+/* 侧边栏项目头环境徽章 ([本机] / [SSH · host] / [☁️ 云端]) */
+.ag-proj-env-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.5px 5px;
+  margin-left: 4px;
+  border-radius: 4px;
+  font: 600 9.5px/1.35 var(--font-mono, monospace);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  flex-shrink: 0;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--muted-foreground, #57534E);
+}
+
+.ag-proj-env-badge[data-env="remote"] {
+  background: rgba(22, 163, 74, 0.12);
+  border-color: rgba(22, 163, 74, 0.32);
+  color: #15803D;
+}
+
+html.dark .ag-proj-env-badge[data-env="remote"] {
+  background: rgba(34, 197, 94, 0.16);
+  border-color: rgba(34, 197, 94, 0.38);
+  color: #4ADE80;
+}
+
+.ag-proj-env-badge[data-env="local"] {
+  background: rgba(37, 99, 235, 0.08);
+  border-color: rgba(37, 99, 235, 0.22);
+  color: #1D4ED8;
+}
+
+html.dark .ag-proj-env-badge[data-env="local"] {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: rgba(59, 130, 246, 0.35);
+  color: #60A5FA;
+}
+
+.ag-proj-env-badge[data-env="cloud"] {
+  background: rgba(124, 58, 237, 0.10);
+  border-color: rgba(124, 58, 237, 0.28);
+  color: #6D28D9;
+}
+
+html.dark .ag-proj-env-badge[data-env="cloud"] {
+  background: rgba(139, 92, 246, 0.18);
+  border-color: rgba(139, 92, 246, 0.38);
+  color: #C4B5FD;
+}
+
+/* 侧边栏按环境即时过滤（包含项目标题、会话行与展开按钮，并重排虚拟列表消除绝对定位空白断层） */
+html[data-ag-env-filter="local"] [aria-label="Sidebar"] div:has(> div[data-sidebar-section-drop-id]),
+html[data-ag-env-filter="remote"] [aria-label="Sidebar"] div:has(> div[data-sidebar-section-drop-id]) {
+  height: auto !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+html[data-ag-env-filter="local"] [aria-label="Sidebar"] div:has(> div[data-sidebar-section-drop-id]) > div,
+html[data-ag-env-filter="remote"] [aria-label="Sidebar"] div:has(> div[data-sidebar-section-drop-id]) > div {
+  position: relative !important;
+  top: auto !important;
+  left: auto !important;
+  transform: none !important;
+}
+
+html[data-ag-env-filter="local"] [aria-label="Sidebar"] div[data-ag-env="remote"],
+html[data-ag-env-filter="local"] [aria-label="Sidebar"] div[data-ag-env="cloud"] {
+  display: none !important;
+}
+
+html[data-ag-env-filter="remote"] [aria-label="Sidebar"] div[data-ag-env="local"],
+html[data-ag-env-filter="remote"] [aria-label="Sidebar"] div[data-ag-env="cloud"] {
+  display: none !important;
+}
+
+/* 项目栏顶部快捷添加远程目录按钮 (🌐+) */
+.ag-sidebar-add-remote-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 5px;
+  margin-right: 2px;
+  border-radius: 4px;
+  font: 600 10.5px var(--ag-ui, system-ui);
+  border: 1px solid rgba(22, 163, 74, 0.32);
+  background: rgba(22, 163, 74, 0.1);
+  color: #15803D;
+  cursor: pointer;
+}
+
+.ag-sidebar-add-remote-btn:hover {
+  background: rgba(22, 163, 74, 0.18);
+}
+
+/* 交互式远程 SSH 目录浏览器弹窗 */
+.ag-remote-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(2px);
+  font: 13px var(--ag-ui, system-ui);
+  color: var(--foreground, #141413);
+}
+
+.ag-remote-modal-dialog {
+  width: min(620px, 92vw);
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: 12px;
+  border: 1px solid var(--border, rgba(0, 0, 0, 0.15));
+  background: var(--background, #FFFFFF);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+}
+
+.ag-remote-modal-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border, rgba(0, 0, 0, 0.1));
+  background: var(--card, #F8F7F4);
+}
+
+.ag-remote-modal-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.ag-remote-modal-badge {
+  padding: 2px 7px;
+  border-radius: 5px;
+  font: 600 11px var(--font-mono, monospace);
+  background: rgba(22, 163, 74, 0.14);
+  color: #15803D;
+  border: 1px solid rgba(22, 163, 74, 0.3);
+}
+
+.ag-remote-modal-close {
+  border: none;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.ag-remote-modal-Quick {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border, rgba(0, 0, 0, 0.08));
+  background: var(--secondary, rgba(0, 0, 0, 0.02));
+}
+
+.ag-remote-quick-lbl {
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+  margin-right: 2px;
+}
+
+.ag-remote-quick-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border, rgba(0, 0, 0, 0.14));
+  background: var(--background, #FFFFFF);
+  color: var(--foreground);
+  font: 11.5px var(--font-mono, monospace);
+  cursor: pointer;
+}
+
+.ag-remote-quick-chip:hover {
+  border-color: #16A34A;
+  color: #15803D;
+}
+
+.ag-remote-modal-pathbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border, rgba(0, 0, 0, 0.08));
+}
+
+.ag-remote-path-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border, rgba(0, 0, 0, 0.18));
+  background: var(--background, #FFFFFF);
+  color: var(--foreground);
+  font: 12.5px var(--font-mono, monospace);
+}
+
+.ag-remote-hidden-lbl {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.ag-remote-modal-list {
+  flex: 1;
+  min-height: 220px;
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ag-remote-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--foreground);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ag-remote-dir-row:hover {
+  background: var(--secondary, rgba(0, 0, 0, 0.06));
+}
+
+.ag-remote-dir-name {
+  font-weight: 500;
+  font-size: 13px;
+}
+
+.ag-remote-dir-sub {
+  margin-left: auto;
+  font: 11px var(--font-mono, monospace);
+  color: var(--muted-foreground);
+}
+
+.ag-remote-list-empty {
+  padding: 28px 16px;
+  text-align: center;
+  color: var(--muted-foreground);
+  font-size: 12.5px;
+}
+
+.ag-remote-modal-ftr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border, rgba(0, 0, 0, 0.1));
+  background: var(--card, #F8F7F4);
+}
+
+.ag-remote-modal-status {
+  font: 11.5px var(--font-mono, monospace);
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ag-remote-modal-ftr-btns {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+

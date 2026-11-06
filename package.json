@@ -1,0 +1,18 @@
+{
+  "name": "agy-ssh-remote",
+  "version": "2026.11.6-ssh-v12",
+  "private": false,
+  "type": "module",
+  "description": "Unified Local + Remote SSH + Official Cloud Workspace Federation for Antigravity Desktop",
+  "bin": {
+    "patchctl": "./src/patchctl.mjs"
+  },
+  "scripts": {
+    "deploy": "bash ./install.sh",
+    "verify": "node ./src/verify.mjs",
+    "status": "node ./src/patchctl.mjs status",
+    "ssh:status": "node ./src/patchctl.mjs ssh status",
+    "ssh:restart": "node ./src/patchctl.mjs ssh restart",
+    "restart": "launchctl kickstart -k gui/$(id -u)/local.fei.antigravity-theme"
+  }
+}

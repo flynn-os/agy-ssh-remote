@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "preset": "high-contrast",
+  "localize": true,
+  "settingsGuard": true,
+  "metrics": true,
+  "sshMode": "auto"
+}
