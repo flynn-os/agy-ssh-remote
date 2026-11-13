@@ -32,13 +32,14 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import zipfile
 
 WEB_BUNDLE_PATCH_VERSION = "20261106-ssh-v11"
-BRIDGE_DAEMON_VERSION = "20261107-ssh-v15"
+BRIDGE_DAEMON_VERSION = "20261114-ssh-v16"
 DEFAULT_HTTPS_PORT = 58282
 DEFAULT_HTTP_PORT = 58283
 DEFAULT_BRIDGE_PORT = 58284
@@ -1832,6 +1833,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, get_cli_summaries(sig))
         elif parsed.path == "/relay/stats":
             self._send_json(200, relay_stats())
+        elif parsed.path.startswith("/swarm-board/"):
+            handle_swarm_board(self, parsed)
         else:
             self._send_json(404, {"ok": False, "error": "Not found"})
 
@@ -1876,6 +1879,132 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(500, {"ok": False, "error": str(e)})
         else:
             self._send_json(404, {"ok": False, "error": "Not found"})
+
+
+# ---- Swarm board passthrough ------------------------------------------------------------
+# The Mac Hub shows its *local* swarm_board sidecar, which cannot see swarms of conversations
+# that run on this host. The gateway sends the pane's data routes here and we answer them
+# from this host's own swarm_board sidecar (started by the remote language_server), found
+# by scanning /proc. Only the read-only GET data routes are exposed.
+SWARM_BOARD_ROUTES = ("/api/swarm", "/api/frame")
+SWARM_BOARD_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_swarm_board_cache = {"ts": 0.0, "targets": []}
+_swarm_board_lock = threading.Lock()
+
+
+def _read_proc_environ(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            raw = f.read()
+    except Exception:
+        return {}
+    env = {}
+    for item in raw.split(b"\0"):
+        if b"=" in item:
+            k, v = item.split(b"=", 1)
+            env[k.decode("utf-8", "ignore")] = v.decode("utf-8", "ignore")
+    return env
+
+
+def _scan_swarm_board_targets():
+    """[{pid, port, appData, lsAddress}] for every running swarm_board sidecar of this user."""
+    out = []
+    uid = os.getuid()
+    try:
+        entries = os.listdir("/proc")
+    except Exception:
+        return out
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{entry}").st_uid != uid:
+                continue
+            cwd = os.readlink(f"/proc/{entry}/cwd")
+        except Exception:
+            continue
+        if not cwd.rstrip("/").endswith("/sidecars/swarm_board"):
+            continue
+        env = _read_proc_environ(entry)
+        port = env.get("ANTIGRAVITY_SIDECAR_WEB_PORT", "")
+        if not port.isdigit():
+            continue
+        out.append({
+            "pid": int(entry),
+            "port": int(port),
+            "appData": env.get("ANTIGRAVITY_APP_DATA_DIR", ""),
+            "lsAddress": env.get("ANTIGRAVITY_LS_ADDRESS", ""),
+        })
+    return out
+
+
+def _swarm_board_targets(refresh=False):
+    with _swarm_board_lock:
+        now = time.time()
+        if refresh or now - _swarm_board_cache["ts"] > 10.0:
+            _swarm_board_cache["targets"] = _scan_swarm_board_targets()
+            _swarm_board_cache["ts"] = now
+        return list(_swarm_board_cache["targets"])
+
+
+def _rank_swarm_board_targets(targets, cid):
+    """Best first: the sidecar whose app data dir holds the conversation, then the one
+    started by our language_server, then the rest."""
+    our_http_port = ""
+    try:
+        with open(os.path.expanduser("~/.antigravity-server/run/server.json"), "r", encoding="utf-8") as f:
+            our_http_port = str(json.load(f).get("httpPort") or "")
+    except Exception:
+        pass
+
+    def score(t):
+        s = 0
+        if cid and t["appData"] and os.path.isdir(os.path.join(t["appData"], "brain", cid)):
+            s += 4
+        if our_http_port and t["lsAddress"].endswith(":" + our_http_port):
+            s += 2
+        if t["appData"].rstrip("/").endswith("/.gemini/antigravity"):
+            s += 1
+        return -s
+
+    return sorted(targets, key=score)
+
+
+def handle_swarm_board(handler, parsed):
+    route = parsed.path[len("/swarm-board"):]
+    if route not in SWARM_BOARD_ROUTES:
+        handler._send_json(404, {"ok": False, "error": "Not found"})
+        return
+    qs = urllib.parse.parse_qs(parsed.query)
+    cid = (qs.get("conversationId") or [""])[0]
+    if not SWARM_BOARD_ID_RE.match(cid):
+        handler._send_json(400, {"ok": False, "error": "conversationId required"})
+        return
+    last_err = "no swarm_board sidecar running"
+    for attempt in range(2):
+        targets = _rank_swarm_board_targets(_swarm_board_targets(refresh=attempt > 0), cid)
+        for t in targets:
+            url = f"http://127.0.0.1:{t['port']}{route}?{parsed.query}"
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=5) as r:
+                    body = r.read()
+                    ctype = r.headers.get("Content-Type") or "application/octet-stream"
+                    status = r.status
+            except urllib.error.HTTPError as e:
+                body = e.read() or b""
+                ctype = e.headers.get("Content-Type") or "text/plain"
+                status = e.code
+            except Exception as e:
+                last_err = str(e)
+                continue
+            handler.send_response(status)
+            handler.send_header("Content-Type", ctype)
+            handler.send_header("Content-Length", str(len(body)))
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            handler.wfile.write(body)
+            return
+    handler._send_json(502, {"ok": False, "error": last_err})
 
 
 def _background_sync_loop():

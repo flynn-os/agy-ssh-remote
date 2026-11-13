@@ -12,6 +12,7 @@ import {fileURLToPath} from 'node:url';
 import {promisify} from 'node:util';
 import {ResumableRelayStream} from './relay-client.mjs';
 import {routeHosts, hostForMode, normalizeSshMode} from './routes.mjs';
+import {DEFAULT_SWARM_PROXY_PORT, createSwarmBoardProxy, rewriteSwarmSidecars} from './swarm-board.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -40,9 +41,11 @@ const LOCAL_WWW_CACHE_DIR = path.join(CACHE_DIR, 'www');
 const LOCAL_WWW_META_PATH = path.join(CACHE_DIR, 'www-meta.json');
 const LOCAL_DELETED_TOMBSTONES_PATH = path.join(CACHE_DIR, 'deleted-conversations.json');
 const LOCAL_WWW_PATCH_VERSION = '20261103-ssh-v10';
-const EXPECTED_BRIDGE_VERSION = '20261107-ssh-v15';
+const EXPECTED_BRIDGE_VERSION = '20261114-ssh-v16';
 const LOCAL_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
 const LOCAL_CLI_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'conversations');
+const LOCAL_BRAIN_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+const SWARM_PROXY_PORT = Number(process.env.AG_SWARM_PROXY_PORT || DEFAULT_SWARM_PROXY_PORT);
 const APP_INFO_PLIST_PATH = '/Applications/Antigravity.app/Contents/Info.plist';
 const LOCAL_APP_LS_BIN_PATH = '/Applications/Antigravity.app/Contents/Resources/bin/language_server';
 const RELEASES_MANIFEST_URL = 'https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/releases';
@@ -206,6 +209,9 @@ let remoteUpstreamH2Port = 0;
 let localUpstreamH2Session = null;
 let localUpstreamH2Port = 0;
 let wwwWarmupInFlight = false;
+let swarmProxyServer = null;
+let swarmProxyListening = false;
+let swarmSidecarUpstreamPort = 0;
 
 // Federation state
 const localProjectsMap = new Map();
@@ -2960,6 +2966,11 @@ async function handleFederatedSubscribeToSidecars(req, res, reqBody) {
             delete sc.userConfig.projectId;
           }
         }
+        if (swarmProxyListening) {
+          rewriteSwarmSidecars(f.json.sidecars, SWARM_PROXY_PORT, (p) => {
+            swarmSidecarUpstreamPort = p;
+          });
+        }
         res.write(encodeDataFrame(f.json));
       } else {
         const raw = Buffer.from(f.text, 'utf8');
@@ -3435,11 +3446,51 @@ function rewriteBodyForRemote(reqBody) {
   return Buffer.from(replacedText, 'utf8');
 }
 
+// Which language_server owns a conversation, for the swarm board pane (src/swarm-board.mjs).
+// 'unknown' (neither side has seen it yet): asked remotely first, falling back to local.
+export function swarmConversationTarget(cid) {
+  if (!cid || sshState.status !== 'connected') return 'local';
+  if (remoteCascadeIds.has(cid)) return 'remote';
+  if (localCascadeIds.has(cid)) return 'local';
+  try {
+    if (
+      fs.existsSync(path.join(LOCAL_CONVERSATIONS_DIR, `${cid}.pb`)) ||
+      fs.existsSync(path.join(LOCAL_CONVERSATIONS_DIR, `${cid}.db`)) ||
+      fs.existsSync(path.join(LOCAL_BRAIN_DIR, cid))
+    ) {
+      return 'local';
+    }
+  } catch {}
+  if (remoteCliSummariesMap.has(cid) || cachedRemoteSummaryUpdates[cid]) return 'remote';
+  return 'unknown';
+}
+
+function ensureSwarmBoardProxy() {
+  if (swarmProxyServer || !SWARM_PROXY_PORT) return;
+  swarmProxyServer = createSwarmBoardProxy({
+    getUpstreamPort: () => swarmSidecarUpstreamPort,
+    conversationTarget: swarmConversationTarget,
+    fetchRemote: async (pathAndQuery) => {
+      if (sshState.status !== 'connected') return null;
+      return bridgeRequest({path: `/swarm-board${pathAndQuery}`, deadlineMs: 6000, bodyIdleMs: 4000});
+    },
+    log: (msg) => logSsh(msg),
+  });
+  swarmProxyServer.on('error', (e) => {
+    swarmProxyListening = false;
+    logSsh(`[swarm-board] proxy on 127.0.0.1:${SWARM_PROXY_PORT} failed: ${e.message}`);
+  });
+  swarmProxyServer.listen(SWARM_PROXY_PORT, '127.0.0.1', () => {
+    swarmProxyListening = true;
+  });
+}
+
 function ensureLocalHttpsProxy() {
   if (localProxyServer) return;
   try {
     const {cert, key} = extractCertAndKey();
     ensureLocalPatchedMainJs();
+    ensureSwarmBoardProxy();
     localProxyServer = http2.createSecureServer({cert, key, allowHTTP1: true}, (req, res) => {
       const reqPath = req.url || '/';
 
@@ -4061,7 +4112,8 @@ export async function syncSidecarAuthorities(portMap = {}) {
         port !== sshState.localTunnelHttpsPort &&
         port !== sshState.localHttpPort &&
         port !== sshState.localBridgePort &&
-        port !== sshState.localMacPort
+        port !== sshState.localMacPort &&
+        port !== SWARM_PROXY_PORT
       ) {
         await ensureSidecarTunnel(host, port);
       }
