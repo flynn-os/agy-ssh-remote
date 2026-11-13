@@ -1,6 +1,6 @@
 (function install(config, css, dictionary, signature) {
   if (!['127.0.0.1', 'localhost'].includes(location.hostname)) return;
-  const PATCH_VERSION = '20261104-ssh-v12';
+  const PATCH_VERSION = '20261110-ssh-v13';
 
   if (typeof window.__ag_multiplexer_booted_before_main === 'undefined') {
     window.__ag_multiplexer_booted_before_main = document.readyState === 'loading';
@@ -617,9 +617,13 @@
 
   function migrateAndSyncStorage() {
     try {
-      const stored = Storage.prototype.getItem.call(localStorage, 'theme-preset-light');
-      if (ALL_CUSTOM_PRESETS.has(stored)) {
+      const storedLight = Storage.prototype.getItem.call(localStorage, 'theme-preset-light');
+      if (ALL_CUSTOM_PRESETS.has(storedLight)) {
         try { Storage.prototype.setItem.call(localStorage, 'theme-preset-light', 'Default Light'); } catch {}
+      }
+      const storedDark = Storage.prototype.getItem.call(localStorage, 'theme-preset-dark');
+      if (ALL_CUSTOM_PRESETS.has(storedDark)) {
+        try { Storage.prototype.setItem.call(localStorage, 'theme-preset-dark', 'Default Dark'); } catch {}
       }
       const flavor = Storage.prototype.getItem.call(localStorage, 'theme-color-flavor');
       const mapped = resolveFlavorPreset(flavor);
@@ -639,14 +643,20 @@
         if (k === 'theme-preset-light' && ALL_CUSTOM_PRESETS.has(val)) {
           return 'Default Light';
         }
+        if (k === 'theme-preset-dark' && ALL_CUSTOM_PRESETS.has(val)) {
+          return 'Default Dark';
+        }
         return val;
       };
       localStorage.setItem = function(k, v) {
         if (k === 'theme-preset-light' && ALL_CUSTOM_PRESETS.has(v)) {
           v = 'Default Light';
         }
+        if (k === 'theme-preset-dark' && ALL_CUSTOM_PRESETS.has(v)) {
+          v = 'Default Dark';
+        }
         originalSet(k, v);
-        if (k === 'theme-preset-light' || k === 'theme-mode' || k === 'theme-color-flavor') {
+        if (k === 'theme-preset-light' || k === 'theme-preset-dark' || k === 'theme-mode' || k === 'theme-color-flavor') {
           if (k === 'theme-color-flavor') {
             const mapped = resolveFlavorPreset(v);
             if (mapped && window.__feiAGPatch) window.__feiAGPatch.setState({preset: mapped});
@@ -660,7 +670,7 @@
 
   migrateAndSyncStorage();
 
-  // ---- i18n engine (ported from chuanban-antigravity-theme-patch v5.0.0 core/runtime.js) ----------
+  // ---- i18n engine (ported from chuanban-antigravity-theme-patch v5.1.0 core/runtime.js) ----------
   // Whole-document translation with an exclusion list, WeakMap-reversible text nodes, data-ag-orig-*
   // reversible attributes (title / placeholder / aria-label) and dirty-root incremental scanning.
   if (!window.__ag_orig_text_map) window.__ag_orig_text_map = new WeakMap();
@@ -694,15 +704,88 @@
   const RE_EXCLUDED = /^(\d+)\s+excluded$/i;
   const RE_TOOLS_EXCLUDED = /^(\d+)\s+tools?\s+excluded$/i;
   const RE_ACTIVE_CONVS = /^(\d+)\s+active\s+conversations?$/i;
+  const RE_UPDATES_COUNT = /^(\d+)\s+updates?$/i;
+  const RE_PROJECTS_COUNT = /^(\d+)\s+projects?$/i;
+  const RE_CALLS_MB = /^(\d+)\s+calls?\s*·\s*([\d.]+\s*MB)$/i;
   const RE_SEE_ALL = /^See all\s*\((\d+)\)$/i;
   const RE_SHOW_BREAKDOWNS = /^Show\s+(\d+)\s+breakdowns?$/i;
+  const RE_SHOW_MORE_SUBAGENTS = /^Show\s+(\d+)\s+more\s+subagents?$/i;
+  const RE_ZIPPING_FOLDER = /^Zipping\s+(.+?)(?:…|\.\.\.)$/i;
   const RE_PERM_DELETE = /^Permanently delete\s+(.*)\s+including\s+(\d+)\s+active\s+conversations\.?$/i;
-  const RE_WORKED_FOR = /^Worked for\s+(\d+[smhd])$/i;
-  const RE_THOUGHT_FOR = /^Thought for\s+(\d+[smhd])$/i;
+  const RE_WORKED_FOR_UPDATES = /^Worked for\s+([<0-9smhd\s]+?)\s*·\s*(\d+)\s+updates?$/i;
+  const RE_WORKED_FOR = /^Worked for\s+([<0-9smhd]+(?:\s+\d+[smhd])*)$/i;
+  const RE_THOUGHT_FOR = /^Thought for\s+([<0-9smhd]+(?:\s+\d+[smhd])*)$/i;
+  const RE_RUNNING_FOR = /^Running\s+for\s+([<0-9smhd]+(?:\s+\d+[smhd])*)$/i;
+  const RE_EPHEMERAL_SUMMARY =
+    /^(Explored(?:\s+(?:\d+\s+)?(?:files?|artifacts?)(?:\s+and\s+(?:\d+\s+)?(?:files?|artifacts?))?)?|Ran\s+(?:\d+\s+)?commands?|Edited(?:\s+(?:\d+\s+)?(?:files?|artifacts?)(?:\s+and\s+(?:\d+\s+)?(?:files?|artifacts?))?)?)(?:,\s*(explored(?:\s+(?:\d+\s+)?(?:files?|artifacts?)(?:\s+and\s+(?:\d+\s+)?(?:files?|artifacts?))?)?|ran\s+(?:\d+\s+)?commands?|edited(?:\s+(?:\d+\s+)?(?:files?|artifacts?)(?:\s+and\s+(?:\d+\s+)?(?:files?|artifacts?))?)?))*$/i;
+  const EPHEMERAL_CLAUSE_MAP = {
+    explored: '已探索',
+    'explored file': '已探索文件',
+    'explored files': '已探索文件',
+    'explored artifact': '已探索交付工件',
+    'explored artifacts': '已探索交付工件',
+    'explored file and artifact': '已探索文件与交付工件',
+    'explored files and artifact': '已探索文件与交付工件',
+    'explored file and artifacts': '已探索文件与交付工件',
+    'explored files and artifacts': '已探索文件与交付工件',
+    'ran command': '已运行命令',
+    'ran commands': '已运行命令',
+    edited: '已编辑',
+    'edited file': '已编辑文件',
+    'edited files': '已编辑文件',
+    'edited artifact': '已编辑交付工件',
+    'edited artifacts': '已编辑交付工件',
+    'edited file and artifact': '已编辑文件与交付工件',
+    'edited files and artifact': '已编辑文件与交付工件',
+    'edited file and artifacts': '已编辑文件与交付工件',
+    'edited files and artifacts': '已编辑文件与交付工件',
+  };
+  const RE_EPHEMERAL_COUNT_CLAUSE = /^(explored|edited|ran)\s+(\d+)\s+(files?|artifacts?|commands?)$/i;
+  function translateEphemeralClause(clause) {
+    const low = clause.trim().toLowerCase();
+    if (EPHEMERAL_CLAUSE_MAP[low]) return EPHEMERAL_CLAUSE_MAP[low];
+    const mCount = low.match(RE_EPHEMERAL_COUNT_CLAUSE);
+    if (mCount) {
+      const vMap = {explored: '已探索', edited: '已编辑', ran: '已运行'};
+      const nMap = {
+        file: '个文件',
+        files: '个文件',
+        artifact: '个交付工件',
+        artifacts: '个交付工件',
+        command: '条命令',
+        commands: '条命令',
+      };
+      return vMap[mCount[1]] + ' ' + mCount[2] + ' ' + nMap[mCount[3]];
+    }
+    return clause.trim();
+  }
+  const RE_EPHEMERAL_ACTIVE = /^(Editing|Reading|Listing|Searching)\s+(.+)$/;
+  const EPHEMERAL_VERB_MAP = {
+    Editing: '正在编辑',
+    Reading: '正在读取',
+    Listing: '正在列出',
+    Searching: '正在搜索',
+  };
+  const EPHEMERAL_NOUN_MAP = {
+    file: '文件',
+    files: '文件',
+    artifact: '交付工件',
+    artifacts: '交付工件',
+    'file and artifact': '文件与交付工件',
+    'files and artifact': '文件与交付工件',
+    'file and artifacts': '文件与交付工件',
+    'files and artifacts': '文件与交付工件',
+  };
+  const RE_RUNNING_CMD = /^Running\s+(?!commands?\b|processes\b|for\b|\(Dev\b)(.+)$/;
+  const RE_DELETED_RECORDINGS = /^Deleted\s+(\d+)\s+recordings?\s*\(([\d.]+\s*MB)\)$/i;
+  const RE_DELETE_RECORDINGS_CONFIRM =
+    /^This deletes\s+(\d+)\s+call recordings?\s*\(([\d.]+\s*MB)\)\s+from your machine\.\s*You can't undo this\.$/i;
   const RE_USED_LIMIT = /^You have used (some|all|most) of your (weekly|5-hour|five-hour|daily) limit,?\s*it will fully refresh in (.*)\.?$/i;
   const RE_NOT_USED_LIMIT = /^You have not used any of your (weekly|5-hour|five-hour|daily) limit\.?$/i;
   const RE_ARIA_BRANCH = /^Branch, current:\s*(.*)$/i;
-  const RE_ARIA_PROJECT = /^Select project, current:\s*(.*)$/i;
+  const RE_ARIA_PROJECT = /^Select project(?:, current)?:\s*(.*)$/i;
+  const RE_ARIA_LOCATION = /^(?:Where the agent runs, current|Select location(?:, current)?):\s*(.*)$/i;
+  const RE_ARIA_VERSION = /^Version\s+([\d.]+(?:\s*·\s*\S+)?)$/i;
   const LIMIT_TYPE_MAP = {weekly: '每周', '5-hour': '5 小时', 'five-hour': '5 小时', daily: '每日'};
 
   function lookupDict(key) {
@@ -725,24 +808,60 @@
     if (!RE_HAS_ALPHA.test(trimmed)) return null;
     const c0 = trimmed.charCodeAt(0);
     if (c0 >= 48 && c0 <= 57) {
+      if (RE_UPDATES_COUNT.test(trimmed)) return raw.replace(RE_UPDATES_COUNT, '$1 条进展');
       if (RE_FILES_CHANGED.test(trimmed)) return raw.replace(RE_FILES_CHANGED, '$1 个文件变更');
       if (RE_TOOLS.test(trimmed)) return raw.replace(RE_TOOLS, '$1 个工具');
       if (RE_DEMOTED.test(trimmed)) return raw.replace(RE_DEMOTED, '$1 项已降级');
       if (RE_EXCLUDED.test(trimmed)) return raw.replace(RE_EXCLUDED, '$1 项已排除');
       if (RE_TOOLS_EXCLUDED.test(trimmed)) return raw.replace(RE_TOOLS_EXCLUDED, '$1 个工具已排除');
       if (RE_ACTIVE_CONVS.test(trimmed)) return raw.replace(RE_ACTIVE_CONVS, '$1 个进行中的会话');
+      if (RE_PROJECTS_COUNT.test(trimmed)) return raw.replace(RE_PROJECTS_COUNT, '$1 个项目');
+      if (RE_CALLS_MB.test(trimmed)) return raw.replace(RE_CALLS_MB, '$1 次通话 · $2');
       return null;
     }
     const firstUpper = trimmed[0].toUpperCase();
     if (firstUpper === 'S') {
       if (RE_SEE_ALL.test(trimmed)) return raw.replace(RE_SEE_ALL, '查看全部 ($1)');
       if (RE_SHOW_BREAKDOWNS.test(trimmed)) return raw.replace(RE_SHOW_BREAKDOWNS, '展开明细 ($1 项)');
+      if (RE_SHOW_MORE_SUBAGENTS.test(trimmed)) return raw.replace(RE_SHOW_MORE_SUBAGENTS, '显示另外 $1 个子代理');
+      const mSearch = trimmed.match(RE_EPHEMERAL_ACTIVE);
+      if (mSearch) {
+        const noun = EPHEMERAL_NOUN_MAP[mSearch[2].toLowerCase()];
+        return raw.replace(trimmed, noun ? EPHEMERAL_VERB_MAP[mSearch[1]] + noun : EPHEMERAL_VERB_MAP[mSearch[1]] + ' ' + mSearch[2]);
+      }
     } else if (firstUpper === 'P') {
       if (RE_PERM_DELETE.test(trimmed)) return raw.replace(RE_PERM_DELETE, '永久删除 $1 及 $2 个进行中的会话。');
     } else if (firstUpper === 'W') {
+      if (RE_WORKED_FOR_UPDATES.test(trimmed)) {
+        return raw.replace(RE_WORKED_FOR_UPDATES, (_, dur, cnt) => '已工作 ' + dur.trim() + ' · ' + cnt + ' 条进展');
+      }
       if (RE_WORKED_FOR.test(trimmed)) return raw.replace(RE_WORKED_FOR, '已工作 $1');
     } else if (firstUpper === 'T') {
       if (RE_THOUGHT_FOR.test(trimmed)) return raw.replace(RE_THOUGHT_FOR, '已思考 $1');
+      if (RE_DELETE_RECORDINGS_CONFIRM.test(trimmed)) {
+        return raw.replace(RE_DELETE_RECORDINGS_CONFIRM, '这将从您的设备中删除 $1 条通话录音（$2），此操作无法撤销。');
+      }
+    } else if (firstUpper === 'E' || firstUpper === 'R' || firstUpper === 'L') {
+      if (RE_EPHEMERAL_SUMMARY.test(trimmed)) {
+        const translatedSummary = trimmed
+          .split(/,\s*/)
+          .map(part => translateEphemeralClause(part))
+          .join('、');
+        return raw.replace(trimmed, translatedSummary);
+      }
+      const mActive = trimmed.match(RE_EPHEMERAL_ACTIVE);
+      if (mActive) {
+        const noun = EPHEMERAL_NOUN_MAP[mActive[2].toLowerCase()];
+        return raw.replace(trimmed, noun ? EPHEMERAL_VERB_MAP[mActive[1]] + noun : EPHEMERAL_VERB_MAP[mActive[1]] + ' ' + mActive[2]);
+      }
+      if (firstUpper === 'R') {
+        if (RE_RUNNING_FOR.test(trimmed)) return raw.replace(RE_RUNNING_FOR, '已运行 $1');
+        if (RE_RUNNING_CMD.test(trimmed)) return raw.replace(RE_RUNNING_CMD, '正在运行 $1');
+      }
+    } else if (firstUpper === 'D') {
+      if (RE_DELETED_RECORDINGS.test(trimmed)) return raw.replace(RE_DELETED_RECORDINGS, '已删除 $1 条录音 ($2)');
+    } else if (firstUpper === 'Z') {
+      if (RE_ZIPPING_FOLDER.test(trimmed)) return raw.replace(RE_ZIPPING_FOLDER, '正在打包 $1…');
     } else if (firstUpper === 'Y') {
       const mUsed = trimmed.match(RE_USED_LIMIT);
       if (mUsed) {
@@ -790,8 +909,8 @@
     const trimmed = origVal.trim();
     const nextVal = resolver ? resolver(trimmed) : (lookupDict(trimmed) ?? null);
     if (typeof nextVal === 'string') {
-      el.setAttribute(origDataAttr, origVal);
-      el.setAttribute(origDataAttr + '-last', nextVal);
+      if (savedOrig !== origVal) el.setAttribute(origDataAttr, origVal);
+      if (savedLast !== nextVal) el.setAttribute(origDataAttr + '-last', nextVal);
       if (cur !== nextVal) el.setAttribute(attrName, nextVal);
     } else if (savedOrig && savedLast === cur) {
       el.setAttribute(attrName, savedOrig);
@@ -800,25 +919,38 @@
     }
   }
 
+  function resolveAttrTranslation(atrim) {
+    const hit = lookupDict(atrim);
+    if (hit !== undefined) return hit;
+    const mBranch = atrim.match(RE_ARIA_BRANCH);
+    if (mBranch) {
+      const bName = mBranch[1].trim();
+      return '分支，当前：' + (bName === 'Select branch' ? '选择分支' : bName);
+    }
+    const mProj = atrim.match(RE_ARIA_PROJECT);
+    if (mProj) {
+      const pName = mProj[1].trim();
+      return '选择项目，当前：' + (pName === 'No project' || pName === 'No Project' ? '未关联项目' : pName);
+    }
+    const mLoc = atrim.match(RE_ARIA_LOCATION);
+    if (mLoc) {
+      const locName = mLoc[1].trim();
+      const mappedLoc =
+        locName === 'This Computer' ? '本机' : locName === 'Remote' ? '远程' : lookupDict(locName) || locName;
+      return '智能体运行位置，当前：' + mappedLoc;
+    }
+    const mVer = atrim.match(RE_ARIA_VERSION);
+    if (mVer) {
+      return '版本 ' + mVer[1].trim();
+    }
+    return computeTextTranslation(atrim);
+  }
+
   function translateElementAttrs(el) {
     if (!el || el.nodeType !== 1) return;
-    translateSingleAttr(el, 'title', 'data-ag-orig-title', null);
+    translateSingleAttr(el, 'title', 'data-ag-orig-title', resolveAttrTranslation);
     translateSingleAttr(el, 'placeholder', 'data-ag-orig-placeholder', null);
-    translateSingleAttr(el, 'aria-label', 'data-ag-orig-aria-label', atrim => {
-      const hit = lookupDict(atrim);
-      if (hit !== undefined) return hit;
-      const mBranch = atrim.match(RE_ARIA_BRANCH);
-      if (mBranch) {
-        const bName = mBranch[1].trim();
-        return '分支，当前：' + (bName === 'Select branch' ? '选择分支' : bName);
-      }
-      const mProj = atrim.match(RE_ARIA_PROJECT);
-      if (mProj) {
-        const pName = mProj[1].trim();
-        return '选择项目，当前：' + (pName === 'No project' ? '未关联项目' : pName);
-      }
-      return null;
-    });
+    translateSingleAttr(el, 'aria-label', 'data-ag-orig-aria-label', resolveAttrTranslation);
   }
 
   const walkerFilter = {
@@ -1618,6 +1750,11 @@
       if (m) return m[1];
       const q = new URLSearchParams(window.location.search).get('cascadeId');
       if (q && /^[0-9a-f-]{36}$/i.test(q)) return q;
+      const selected = document.querySelector('[data-testid=conversation-row-sidebar][data-selected=true]');
+      if (selected) {
+        const cid = selected.getAttribute('data-cascade-id');
+        if (cid && /^[0-9a-f-]{36}$/i.test(cid)) return cid;
+      }
     } catch {}
     return '';
   }
@@ -1638,14 +1775,23 @@
 
   function findFooterRow(box) {
     if (!box) return null;
+    const directFooter = box.querySelector('.agy-composer-footer');
+    if (directFooter && directFooter.children.length >= 2) {
+      return directFooter;
+    }
     const rows = box.querySelectorAll('div.flex.w-full.items-center.justify-between');
     for (let i = rows.length - 1; i >= 0; i--) {
       const r = rows[i];
+      if (r.getAttribute('data-testid') === 'input-box-bottom-toolbar') continue;
       if (r.querySelector('[data-testid="model-selector-trigger"], [data-testid="send-button"]')) {
         return r;
       }
     }
-    return rows[rows.length - 1] || null;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const r = rows[i];
+      if (r.getAttribute('data-testid') !== 'input-box-bottom-toolbar') return r;
+    }
+    return directFooter || null;
   }
 
   function measureNaturalLeftWidth(leftGroup) {
@@ -1863,24 +2009,54 @@
     checkRouteAndMountMetrics();
   }
 
-  // Root attributes consumed by chuanban v5.0.0 theme.css (wax-seal C/A/B states, ClearType, font-size vars)
+  // Root attributes consumed by chuanban v5.1.0 theme.css (light/dark decoupled mode, wax-seal C/A/B states, ClearType, font-size vars)
   function applyThemeVars(varsObj) {
-    const vars = varsObj && typeof varsObj === 'object' ? varsObj : {};
     const prevKeys = Array.isArray(window.__ag_applied_theme_vars) ? window.__ag_applied_theme_vars : [];
-    for (const k of prevKeys) if (!(k in vars)) document.documentElement.style.removeProperty(k);
-    const nextKeys = [];
+    for (const k of prevKeys) {
+      document.documentElement.style.removeProperty(k);
+      if (document.body) document.body.style.removeProperty(k);
+    }
+    window.__ag_applied_theme_vars = [];
+
+    const vars = varsObj && typeof varsObj === 'object' ? varsObj : {};
+    const globalDecls = [];
+    const lightDecls = [];
+    const darkDecls = [];
+
     for (const [k, v] of Object.entries(vars)) {
-      if (!k.startsWith('--')) continue;
-      if (v !== null && v !== undefined && String(v).trim() !== '') {
-        document.documentElement.style.setProperty(k, String(v).trim());
-        nextKeys.push(k);
+      if (!k.startsWith('--') || v === null || v === undefined || String(v).trim() === '') continue;
+      const cleanVal = String(v).trim().replace(/[;{}]/g, '');
+      if (k.startsWith('--ag-dark-')) {
+        darkDecls.push(`${k}: ${cleanVal} !important;`);
+      } else if (k.startsWith('--ag-')) {
+        globalDecls.push(`${k}: ${cleanVal} !important;`);
       } else {
-        document.documentElement.style.removeProperty(k);
+        lightDecls.push(`${k}: ${cleanVal} !important;`);
       }
     }
+
+    let varStyle = document.getElementById('ag-user-theme-vars');
+    if (globalDecls.length === 0 && lightDecls.length === 0 && darkDecls.length === 0) {
+      if (varStyle) varStyle.remove();
+    } else {
+      const head = document.head || document.getElementsByTagName('head')[0] || document.documentElement;
+      if (!varStyle) {
+        varStyle = document.createElement('style');
+        varStyle.id = 'ag-user-theme-vars';
+        if (head) head.appendChild(varStyle);
+      }
+      const blocks = [];
+      if (globalDecls.length > 0) blocks.push(`:root, html, body { ${globalDecls.join(' ')} }`);
+      if (lightDecls.length > 0) blocks.push(`html:not(:has(> body.dark)), body:not(.dark) { ${lightDecls.join(' ')} }`);
+      if (darkDecls.length > 0) blocks.push(`html:has(> body.dark), body.dark { ${darkDecls.join(' ')} }`);
+      const nextCss = blocks.join('\n');
+      if (varStyle.textContent !== nextCss) {
+        varStyle.textContent = nextCss;
+      }
+    }
+
     if (vars['--ag-chat-font-size']) document.documentElement.setAttribute('data-ag-custom-font-size', 'true');
     else document.documentElement.removeAttribute('data-ag-custom-font-size');
-    window.__ag_applied_theme_vars = nextKeys;
   }
 
   function syncRootFeatureAttrs() {
@@ -1889,6 +2065,27 @@
     if (root.getAttribute('data-ag-wax-seal') !== waxSeal) root.setAttribute('data-ag-wax-seal', waxSeal);
     const os = /Win/i.test(navigator.platform || '') ? 'win32' : /Mac/i.test(navigator.platform || '') ? 'darwin' : 'linux';
     if (root.getAttribute('data-ag-os') !== os) root.setAttribute('data-ag-os', os);
+    const isDark = !!(
+      document.body &&
+      (document.body.classList.contains('dark') ||
+        document.body.classList.contains('theme-dark') ||
+        document.body.classList.contains('dark-theme'))
+    );
+    const targetMode = isDark ? 'dark' : 'light';
+    const prevMode = root.getAttribute('data-ag-theme-mode');
+    if (prevMode !== targetMode || window.__ag_last_synced_preset !== state.preset) {
+      root.setAttribute('data-ag-theme-mode', targetMode);
+      window.__ag_last_synced_preset = state.preset;
+      try {
+        const cs = getComputedStyle(document.body || root);
+        const sidebarBg = cs.getPropertyValue('--sidebar').trim() || (isDark ? '#111114' : '#F7F5F0');
+        const fgColor = cs.getPropertyValue('--foreground').trim() || (isDark ? '#FAFAFA' : '#1F1E1D');
+        window.electronNative?.setTitleBarOverlay?.({
+          color: sidebarBg,
+          symbolColor: fgColor,
+        });
+      } catch {}
+    }
     const sigVars = JSON.stringify(config.themeVars || {});
     if (window.__ag_theme_vars_sig !== sigVars) {
       window.__ag_theme_vars_sig = sigVars;
@@ -1899,15 +2096,18 @@
 
   function syncPageType() {
     try {
-      const box = document.getElementById('antigravity.agentSidePanelInputBox');
-      const hasBranchPillInBox = !!box?.querySelector(
-        '[data-testid="branch-pill-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]'
-      );
-      const isHome =
-        hasBranchPillInBox ||
-        !!document.querySelector('[data-testid="home-greeting"]') ||
-        location.pathname === '/' ||
-        !location.pathname.startsWith('/c/');
+      const pathname = location.pathname;
+      const isNonChatRoute = pathname === '/' || !pathname.startsWith('/c/');
+      let isHome = isNonChatRoute;
+      if (!isHome) {
+        const box = document.getElementById('antigravity.agentSidePanelInputBox');
+        const hasBranchPillInBox = !!box?.querySelector(
+          '[data-testid="branch-pill-trigger"], [data-testid="project-branch-picker"], [data-testid="project-selector-trigger"], [data-testid="location-selector-trigger"], [aria-label^="Select project"], [aria-label^="选择项目"]'
+        );
+        isHome =
+          hasBranchPillInBox ||
+          !!document.querySelector('[data-testid="home-greeting"], [data-testid="home-splash-content"]');
+      }
       const pageType = isHome ? 'home' : 'chat';
       if (document.documentElement.getAttribute('data-ag-page-type') !== pageType) {
         document.documentElement.setAttribute('data-ag-page-type', pageType);
@@ -2008,7 +2208,7 @@
     const option = target.closest('[role="option"]');
     if (option && document.querySelector('.settings-modal-container')) {
       const name = option.textContent.trim();
-      if (['Default Light','Default Dark','Catppuccin','Gruvbox Material','One Light','One Dark','Solarized'].includes(name))
+      if (['Catppuccin','Gruvbox Material','One Light','One Dark','Solarized'].includes(name))
         setState({preset: 'native'});
     }
     schedule();
@@ -2095,6 +2295,7 @@
       version: window.__ag_patch_version,
       style: !!document.getElementById(styleId),
       preset: state.preset,
+      themeMode: document.documentElement.getAttribute('data-ag-theme-mode') || 'light',
       localize: state.localize,
       metrics: state.metrics,
       sshMode: sshState.mode || state.sshMode,
@@ -2136,12 +2337,14 @@
       for (const b of document.querySelectorAll('.ag-proj-env-badge')) b.remove();
       document.documentElement.removeAttribute(attr);
       document.documentElement.removeAttribute(legacyAttr);
+      document.documentElement.removeAttribute('data-ag-theme-mode');
       document.documentElement.removeAttribute('data-ag-env-filter');
       document.documentElement.removeAttribute('data-ag-page-type');
       document.documentElement.removeAttribute('data-ag-wax-seal');
       document.documentElement.removeAttribute('data-ag-os');
       applyThemeVars({});
       delete window.__ag_theme_vars_sig;
+      delete window.__ag_last_synced_preset;
       if (window.__ag_metrics_ro) {
         try { window.__ag_metrics_ro.disconnect(); } catch {}
         window.__ag_metrics_ro = null;

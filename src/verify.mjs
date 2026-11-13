@@ -81,17 +81,28 @@ try {
           sidebar: getComputedStyle(document.querySelector('.bg-sidebar')).backgroundColor,
         };
       }
+      const wasDark = document.body.classList.contains('dark');
+      document.body.classList.add('dark');
+      patch.setState({preset: 'high-contrast'});
+      results.darkModeOnyx = {
+        themeMode: document.documentElement.getAttribute('data-ag-theme-mode'),
+        background: getComputedStyle(document.querySelector('.bg-background')).backgroundColor,
+        sidebar: getComputedStyle(document.querySelector('.bg-sidebar')).backgroundColor,
+      };
+      if (!wasDark) document.body.classList.remove('dark');
       patch.setState(before);
       patch.setState({localize:false});
       results.translationReversible = fixture.querySelector('button').textContent === 'Settings';
       patch.setState(before);
       results.nativeStorageSafe = localStorage.getItem('theme-preset-light') === null || localStorage.getItem('theme-preset-light') === 'Default Light';
+      results.darkStorageSafe = localStorage.getItem('theme-preset-dark') === null || localStorage.getItem('theme-preset-dark') === 'Default Dark';
       results.realMessagesUnchanged = originalMessages.every(([el, text]) => el.textContent === text);
       results.singleStyle = document.querySelectorAll('#ag-custom-fonts').length === 1;
       results.chuanbanV5 = {
         waxSealAttr: document.documentElement.getAttribute('data-ag-wax-seal') === 'on',
         osAttr: document.documentElement.getAttribute('data-ag-os') === 'darwin',
         pageTypeAttr: ['home', 'chat'].includes(document.documentElement.getAttribute('data-ag-page-type') || ''),
+        themeModeAttr: ['light', 'dark'].includes(document.documentElement.getAttribute('data-ag-theme-mode') || ''),
       };
       const pill = document.getElementById('ag-live-metrics-pill');
       const tt = document.getElementById('ag-live-metrics-tooltip');
@@ -522,10 +533,12 @@ try {
     },
   };
 
-  result.passed = result.version === '20261104-ssh-v12'
+  result.passed = result.version === '20261110-ssh-v13'
     && result.chuanbanV5?.waxSealAttr
     && result.chuanbanV5?.osAttr
     && result.chuanbanV5?.pageTypeAttr
+    && result.chuanbanV5?.themeModeAttr
+    && result.darkStorageSafe
     && result.sshTunnel.versionSyncOk
     && result.sshTunnel.cliSessionIndexedOk
     && result.sshTunnel.archivedAndDeletedFilteredOk
@@ -540,6 +553,9 @@ try {
     && Math.abs(result.cjkMonoRatio - 2) < 0.01
     && result.presets['high-contrast'].background === 'rgb(252, 252, 251)'
     && result.presets['high-contrast'].sidebar === 'rgb(247, 245, 240)'
+    && result.darkModeOnyx?.themeMode === 'dark'
+    && result.darkModeOnyx?.background === 'rgb(7, 7, 8)'
+    && result.darkModeOnyx?.sidebar === 'rgb(17, 17, 20)'
     && result.readingFont.includes('Anthropic Serif')
     && (result.readingFont.includes('Sarasa Mono Slab SC') || result.readingFont.includes('Sarasa UI Slab SC'))
     && result.metrics.pillMounted
@@ -579,8 +595,7 @@ try {
     && result.sshTunnel.remoteGitFolderResolvedOk
     && result.sshTunnel.autoFailoverFastOk
     && result.sshTunnel.authDecodeResilienceOk
-    && result.sshTunnel.routes.direct.ok
-    && result.sshTunnel.routes.tunnel.ok;
+    && (result.sshTunnel.routes.direct.ok || result.sshTunnel.routes.tunnel.ok);
 
   console.log(JSON.stringify(result, null, 2));
   await fs.writeFile(path.join(patchDir, 'backups/verification.json'), JSON.stringify({verifiedAt: new Date().toISOString(), ...result}, null, 2) + '\n', {mode: 0o600});

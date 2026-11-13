@@ -22,7 +22,7 @@ import {
   setSshLogger,
 } from './ssh-remote.mjs';
 
-const PATCH_VERSION = '20261104-ssh-v12';
+const PATCH_VERSION = '20261110-ssh-v13';
 const sessions = new Map();
 const logFile = path.join(patchDir, 'logs/patch.log');
 const CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini/antigravity/conversations');

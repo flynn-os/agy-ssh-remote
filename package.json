@@ -1,6 +1,6 @@
 {
   "name": "agy-ssh-remote",
-  "version": "2026.11.6-ssh-v12",
+  "version": "2026.11.10-ssh-v13",
   "private": false,
   "type": "module",
   "description": "Unified Local + Remote SSH + Official Cloud Workspace Federation for Antigravity Desktop",
