@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {patchDir} from './cdp.mjs';
 import {SSH_MODES, normalizeSshMode} from './routes.mjs';
+import {resolveFallbackContextLimit} from './metrics.mjs';
 
 export const presets = ['high-contrast', 'claude-desktop-purewhite', 'vintage-deep', 'native'];
 export const sshModes = SSH_MODES;
@@ -81,6 +82,20 @@ export async function readConfig() {
     ...(config.themeVars || {}),
   };
   return config;
+}
+
+export async function readFallbackContextLimit() {
+  const [cfgPath, userCfgPath] = await Promise.all([
+    resolveExistingPath('config.json', 'config/config.json'),
+    resolveExistingPath('user/config.json', 'config/user/config.json'),
+  ]);
+  const [config, userConfig] = await Promise.all([
+    readJsonOptional(cfgPath, {}),
+    readJsonOptional(userCfgPath, {}),
+  ]);
+  return resolveFallbackContextLimit({
+    contextLimit: config.contextLimit ?? userConfig.contextLimit,
+  });
 }
 
 export async function saveConfig(config) {

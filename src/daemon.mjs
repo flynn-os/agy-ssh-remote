@@ -4,7 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {targets, connect, patchDir} from './cdp.mjs';
-import {readConfig, saveConfig, build} from './bundle.mjs';
+import {readConfig, saveConfig, build, readFallbackContextLimit} from './bundle.mjs';
+import {
+  DEFAULT_CONTEXT_LIMIT_TOKENS,
+  parseSingleMetricRow,
+  computeMetricsFromRows,
+} from './metrics.mjs';
 import {normalizeSshMode} from './routes.mjs';
 import {
   ensureRemoteTunnel,
@@ -27,14 +32,14 @@ const sessions = new Map();
 const logFile = path.join(patchDir, 'logs/patch.log');
 const CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini/antigravity/conversations');
 const CLI_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini/antigravity-cli/conversations');
-const CONTEXT_LIMIT_TOKENS = 256000;
-const localMetricsCache = new Map();  // cascadeId -> { sig, payload }
-const remoteMetricsCache = new Map(); // cascadeId -> { sig, payload }
+const localMetricsCache = new Map();  // cascadeId -> { sig, fallbackLimit, payload, parsedMap }
+const remoteMetricsCache = new Map(); // cascadeId -> { sig, fallbackLimit, payload, parsedMap }
 
 let stopping = false;
 let busy = false;
 let lastError = '';
 let tunnelInitialized = false;
+let fallbackContextLimit = DEFAULT_CONTEXT_LIMIT_TOKENS;
 
 async function log(message) {
   try {
@@ -42,146 +47,6 @@ async function log(message) {
       await fs.rename(logFile, `${logFile}.1`);
     await fs.appendFile(logFile, `${new Date().toISOString()} ${message}\n`, {mode: 0o600});
   } catch {}
-}
-
-function parseProto(buf) {
-  let i = 0;
-  const out = new Map();
-  while (i < buf.length) {
-    let tag = 0, shift = 0;
-    while (i < buf.length) {
-      const b = buf[i++];
-      tag |= (b & 0x7f) << shift;
-      if (!(b & 0x80)) break;
-      shift += 7;
-    }
-    const fn = tag >>> 3, wt = tag & 7;
-    if (wt === 0) {
-      let val = 0, s = 0;
-      while (i < buf.length) {
-        const b = buf[i++];
-        val += (b & 0x7f) * Math.pow(2, s);
-        if (!(b & 0x80)) break;
-        s += 7;
-      }
-      out.set(fn, val);
-    } else if (wt === 2) {
-      let len = 0, s = 0;
-      while (i < buf.length) {
-        const b = buf[i++];
-        len |= (b & 0x7f) << s;
-        if (!(b & 0x80)) break;
-        s += 7;
-      }
-      out.set(fn, buf.subarray(i, i + len));
-      i += len;
-    } else if (wt === 1) {
-      out.set(fn, buf.subarray(i, i + 8)); i += 8;
-    } else if (wt === 5) {
-      out.set(fn, buf.subarray(i, i + 4)); i += 4;
-    } else break;
-  }
-  return out;
-}
-
-function fmtTok(n) {
-  if (!n || n <= 0) return '0';
-  if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
-  if (n >= 10000) return Math.round(n / 1000) + 'k';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
-  return String(n);
-}
-const fmtNum = n => (n || 0).toLocaleString('en-US');
-
-function parseSingleMetricRow(r) {
-  const rawVal = r.data ?? r.b64 ?? '';
-  const rawBuf = Buffer.isBuffer(rawVal)
-    ? rawVal
-    : (rawVal instanceof Uint8Array ? Buffer.from(rawVal) : Buffer.from(String(rawVal), 'base64'));
-  const top = parseProto(rawBuf);
-  const chat = top.has(1) ? parseProto(top.get(1)) : new Map();
-  const usage = chat.has(4) ? parseProto(chat.get(4)) : new Map();
-  const ttftMap = chat.has(11) ? parseProto(chat.get(11)) : new Map();
-  const streamMap = chat.has(12) ? parseProto(chat.get(12)) : new Map();
-
-  const inTok = usage.get(2) || 0, outTok = usage.get(3) || 0, cacheRead = usage.get(5) || 0;
-  const thinkTok = usage.get(9) || 0, respTok = usage.get(10) || 0;
-  const ttft = (ttftMap.get(1) || 0) + (ttftMap.get(2) || 0) / 1e9;
-  const stream = (streamMap.get(1) || 0) + (streamMap.get(2) || 0) / 1e9;
-
-  return {idx: r.idx, inTok, outTok, cacheRead, ctx: inTok + cacheRead, thinkTok, respTok, ttft, stream, totDur: ttft + stream};
-}
-
-function computeMetricsFromRows(cascadeId, sig, rows, userSteps, plannerSteps, preParsedRows = null) {
-  const parsed = preParsedRows || (rows || []).map(parseSingleMetricRow);
-  if (!parsed || parsed.length === 0) {
-    return {cascadeId, hasData: false, sig};
-  }
-  const normIdx = item => (typeof item === 'number' ? item : item?.idx ?? 0);
-  const lastUserStepIdx = userSteps.length > 0 ? normIdx(userSteps[userSteps.length - 1]) : -1;
-  let totalIn = 0, totalCache = 0, totalOut = 0, totalThink = 0, totalResp = 0;
-  let rawTurnSteps = 0;
-  for (let i = 0; i < plannerSteps.length; i++) {
-    if (normIdx(plannerSteps[i]) > lastUserStepIdx) rawTurnSteps++;
-  }
-
-  for (let i = 0; i < parsed.length; i++) {
-    const p = parsed[i];
-    totalIn += p.inTok; totalCache += p.cacheRead; totalOut += p.outTok;
-    totalThink += p.thinkTok; totalResp += p.respTok;
-  }
-
-  // Filter 0-usage metadata snapshot rows (upstream chuanban v5.0.0) so Ctx never drops to 0%
-  const valid = parsed.filter(p => p.ctx > 0 || p.outTok > 0);
-  if (valid.length === 0) {
-    return {cascadeId, hasData: false, sig};
-  }
-
-  const turnSlice = rawTurnSteps > 0 ? valid.slice(-rawTurnSteps) : [];
-  const turnSteps = turnSlice.length;
-  let turnOut = 0, turnThink = 0, turnResp = 0, turnDur = 0;
-  for (let i = 0; i < turnSlice.length; i++) {
-    turnOut += turnSlice[i].outTok;
-    turnThink += turnSlice[i].thinkTok;
-    turnResp += turnSlice[i].respTok;
-    turnDur += turnSlice[i].totDur;
-  }
-
-  const last = valid[valid.length - 1];
-  const streamTps = last.stream >= 0.25 ? (last.outTok / last.stream) : 0;
-  const e2eTps = last.totDur > 0 ? (last.outTok / last.totDur) : 0;
-  const displayTps = (streamTps > 0 && streamTps <= 600) ? streamTps : e2eTps;
-  const ctxPct = Math.round((last.ctx / CONTEXT_LIMIT_TOKENS) * 100);
-  const ctxClass = ctxPct >= 90 ? 'ag-ctx-crit' : (ctxPct >= 75 ? 'ag-ctx-warn' : 'ag-ctx-ok');
-  const lastCacheRate = last.ctx > 0 ? ((last.cacheRead / last.ctx) * 100).toFixed(1) : '0.0';
-  const sessionCacheRate = (totalIn + totalCache) > 0 ? ((totalCache / (totalIn + totalCache)) * 100).toFixed(1) : '0.0';
-  const remainCtx = Math.max(0, CONTEXT_LIMIT_TOKENS - last.ctx);
-
-  const inlineHtml = [
-    `<span>${Math.round(displayTps)} tok/s</span><span class="ag-sep">·</span>`,
-    `<span>TTFT ${last.ttft.toFixed(1)}s</span><span class="ag-sep">·</span>`,
-    `<span>Ctx ${fmtTok(last.ctx)}/256k <span class="${ctxClass}">(${ctxPct}%)</span></span><span class="ag-sep">·</span>`,
-    `<span>Out ${fmtTok(last.outTok)}</span>`,
-  ].join('');
-
-  const turnRowHtml = turnSteps > 1
-    ? `<div class="ag-tt-row"><span class="ag-tt-lbl">本轮合计 (${turnSteps}步)</span><span class="ag-tt-val">输出 ${fmtNum(turnOut)} (思考 ${fmtNum(turnThink)} + 响应 ${fmtNum(turnResp)}) | 耗时 ${turnDur.toFixed(1)}s</span></div>`
-    : '';
-
-  const tooltipHtml = [
-    `<div class="ag-tt-hdr">本轮最新调用 (Gen #${last.idx + 1})</div>`,
-    `<div class="ag-tt-row"><span class="ag-tt-lbl">生成速度</span><span class="ag-tt-val">${streamTps > 0 && streamTps <= 600 ? `流式 ${streamTps.toFixed(1)} tok/s | ` : ''}端到端 ${e2eTps.toFixed(1)} tok/s</span></div>`,
-    `<div class="ag-tt-row"><span class="ag-tt-lbl">响应耗时</span><span class="ag-tt-val">TTFT ${last.ttft.toFixed(2)}s | 流式 ${last.stream.toFixed(2)}s | 总计 ${last.totDur.toFixed(2)}s</span></div>`,
-    `<div class="ag-tt-row"><span class="ag-tt-lbl">当前上下文</span><span class="ag-tt-val">${fmtNum(last.ctx)} (新增 ${fmtNum(last.inTok)} + 缓存 ${fmtNum(last.cacheRead)}, ${lastCacheRate}%)</span></div>`,
-    `<div class="ag-tt-row"><span class="ag-tt-lbl">本步输出量</span><span class="ag-tt-val">${fmtNum(last.outTok)} (思考链 ${fmtNum(last.thinkTok)} + 正文/工具 ${fmtNum(last.respTok)})</span></div>`,
-    turnRowHtml,
-    `<div class="ag-tt-hdr ag-tt-sec">当前会话累计 (${userSteps.length} 轮提问 / ${valid.length} 次有效调用)</div>`,
-    `<div class="ag-tt-row"><span class="ag-tt-lbl">压缩水位线</span><span class="ag-tt-val">${fmtTok(last.ctx)} / 256k (${ctxPct}%) · 距压缩余 ${fmtTok(remainCtx)}</span></div>`,
-    `<div class="ag-tt-row"><span class="ag-tt-lbl">累计输入量</span><span class="ag-tt-val">新增 ${fmtTok(totalIn)} + 缓存读取 ${fmtTok(totalCache)} (命中率 ${sessionCacheRate}%)</span></div>`,
-    `<div class="ag-tt-row"><span class="ag-tt-lbl">累计输出量</span><span class="ag-tt-val">总计 ${fmtTok(totalOut)} (思考链 ${fmtTok(totalThink)} + 正文/工具 ${fmtTok(totalResp)})</span></div>`,
-  ].join('');
-
-  return {cascadeId, hasData: true, sig, inlineHtml, tooltipHtml};
 }
 
 function resolveLocalDbPath(cascadeId) {
@@ -212,7 +77,7 @@ function readLocalConversationMetrics(cascadeId) {
   const sig = getDbSignature(cascadeId);
   if (!sig) return {cascadeId, hasData: false};
   const cached = localMetricsCache.get(cascadeId);
-  if (cached && cached.sig === sig) return cached.payload;
+  if (cached && cached.sig === sig && cached.fallbackLimit === fallbackContextLimit) return cached.payload;
 
   const dbPath = resolveLocalDbPath(cascadeId);
   let db;
@@ -235,8 +100,8 @@ function readLocalConversationMetrics(cascadeId) {
     db.close(); db = null;
 
     const sortedParsed = [...prevParsedMap.keys()].sort((a, b) => a - b).map(k => prevParsedMap.get(k));
-    const payload = computeMetricsFromRows(cascadeId, sig, null, userSteps, plannerSteps, sortedParsed);
-    localMetricsCache.set(cascadeId, {sig, payload, parsedMap: prevParsedMap});
+    const payload = computeMetricsFromRows(cascadeId, sig, null, userSteps, plannerSteps, sortedParsed, fallbackContextLimit);
+    localMetricsCache.set(cascadeId, {sig, fallbackLimit: fallbackContextLimit, payload, parsedMap: prevParsedMap});
     return payload;
   } catch {
     if (db) { try { db.close(); } catch {} }
@@ -286,7 +151,7 @@ async function readRemoteConversationMetricsOnce(cascadeId) {
   }
   remoteMetricsBackoff.delete(cascadeId);
   if (!raw.hasData) return {cascadeId, hasData: false, sig: raw.sig || ''};
-  if (raw.unchanged && cached) return cached.payload;
+  if (raw.unchanged && cached && cached.fallbackLimit === fallbackContextLimit) return cached.payload;
   const nextParsedMap = raw.delta ? prevParsedMap : new Map();
   for (const r of raw.rows || []) {
     nextParsedMap.set(Number(r.idx), parseSingleMetricRow(r));
@@ -298,9 +163,10 @@ async function readRemoteConversationMetricsOnce(cascadeId) {
     null,
     raw.userSteps || [],
     raw.plannerSteps || [],
-    sortedParsed
+    sortedParsed,
+    fallbackContextLimit
   );
-  remoteMetricsCache.set(cascadeId, {sig: raw.sig, payload, parsedMap: nextParsedMap});
+  remoteMetricsCache.set(cascadeId, {sig: raw.sig, fallbackLimit: fallbackContextLimit, payload, parsedMap: nextParsedMap});
   return payload;
 }
 
@@ -352,9 +218,18 @@ async function pushMetricsToSession(session, cascadeId, force = false) {
       }
     }
     if (!payload) return;
-    if (!force && session.lastMetricsCascade === cascadeId && session.lastMetricsSig === payload.sig) return;
+    const nextLimit = payload.contextLimit || 0;
+    if (
+      !force &&
+      session.lastMetricsCascade === cascadeId &&
+      session.lastMetricsSig === payload.sig &&
+      session.lastMetricsLimit === nextLimit
+    ) {
+      return;
+    }
     session.lastMetricsCascade = cascadeId;
     session.lastMetricsSig = payload.sig || '';
+    session.lastMetricsLimit = nextLimit;
     await session.client.evaluate(`window.__ag_render_metrics && window.__ag_render_metrics(${JSON.stringify(payload)})`);
   } catch {}
 }
@@ -566,6 +441,7 @@ async function sync() {
   busy = true;
   try {
     const config = await readConfig();
+    fallbackContextLimit = await readFallbackContextLimit();
     if (!config.enabled) {
       for (const session of sessions.values()) await detach(session);
       sessions.clear();
@@ -599,6 +475,7 @@ async function sync() {
           scriptId: null,
           lastMetricsCascade: '',
           lastMetricsSig: '',
+          lastMetricsLimit: 0,
           lastSshStateSig: '',
           watchedCascadeId: '',
         };

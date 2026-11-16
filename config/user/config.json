@@ -2,7 +2,7 @@
   "enabled": true,
   "channel": "auto",
   "preset": "high-contrast",
-  "contextLimit": 256000,
+  "contextLimit": "auto",
   "modules": {
     "i18n": true,
     "metrics": true,

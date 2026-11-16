@@ -1743,7 +1743,7 @@
     updateSettingsSshControls();
   }
 
-  // --- §5.5 模型名称同行实时指标栏（TPS / TTFT / 256k 上下文水位 / Token 消耗） ---
+  // --- §5.5 模型名称同行实时指标栏（TPS / TTFT / 动态上下文水位 / Token 消耗） ---
   function extractCascadeId() {
     try {
       const m = window.location.pathname.match(/\/c\/([0-9a-f-]{36})/i);
