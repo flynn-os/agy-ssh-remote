@@ -6,22 +6,39 @@ const __dirname = path.dirname(new URL(import.meta.url).pathname);
 export const patchDir = path.basename(__dirname) === 'src' ? path.dirname(__dirname) : __dirname;
 export const portFile = path.join(os.homedir(), 'Library/Application Support/antigravity/DevToolsActivePort');
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+export function isPatchableTarget(target, port = null) {
+  if (!target || typeof target !== 'object') return false;
+  try {
+    const title = String(target.title || '');
+    if (/\(SSH:\s/i.test(title)) return false;
+    const url = new URL(target.url);
+    if (!['http:', 'https:'].includes(url.protocol)) return false;
+    if (!LOOPBACK_HOSTS.has(url.hostname)) return false;
+    if (target.type !== 'page') return false;
+    if (!(/(^| - )(Antigravity|Jetski Web)/i.test(title) || url.protocol === 'https:')) return false;
+    if (port !== null || target.webSocketDebuggerUrl !== undefined) {
+      const ws = new URL(target.webSocketDebuggerUrl);
+      if (ws.protocol !== 'ws:') return false;
+      if (port !== null) {
+        if (ws.hostname !== '127.0.0.1' || Number(ws.port) !== port) return false;
+      } else if (!LOOPBACK_HOSTS.has(ws.hostname)) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function targets() {
   const port = Number((await fs.readFile(portFile, 'utf8')).split('\n')[0]);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw Error('Invalid local debug port');
   const response = await fetch(`http://127.0.0.1:${port}/json/list`, {signal: AbortSignal.timeout(3000)});
   if (!response.ok) throw Error(`Debug endpoint HTTP ${response.status}`);
-  return (await response.json()).filter(target => {
-    try {
-      const url = new URL(target.url);
-      const ws = new URL(target.webSocketDebuggerUrl);
-      return target.type === 'page'
-        && (/(^| - )(Antigravity|Jetski Web)/i.test(target.title) || url.protocol === 'https:')
-        && ['127.0.0.1', 'localhost'].includes(url.hostname)
-        && ['http:', 'https:'].includes(url.protocol)
-        && ws.protocol === 'ws:' && ws.hostname === '127.0.0.1' && Number(ws.port) === port;
-    } catch { return false; }
-  });
+  return (await response.json()).filter(target => isPatchableTarget(target, port));
 }
 
 export async function connect(target) {

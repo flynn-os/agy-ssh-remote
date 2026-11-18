@@ -27,7 +27,7 @@ import {
   setSshLogger,
 } from './ssh-remote.mjs';
 
-const PATCH_VERSION = '20261110-ssh-v13';
+const PATCH_VERSION = '20261118-ssh-v14';
 const sessions = new Map();
 const logFile = path.join(patchDir, 'logs/patch.log');
 const CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini/antigravity/conversations');
@@ -415,6 +415,10 @@ async function handleSshAction(session, rawPayload) {
 }
 
 async function detach(session, restore = true) {
+  if (session.navTimer) {
+    clearTimeout(session.navTimer);
+    session.navTimer = null;
+  }
   if (session.client.open) {
     if (session.scriptId) await session.client.call('Page.removeScriptToEvaluateOnNewDocument', {identifier: session.scriptId}).catch(() => {});
     if (restore) await session.client.evaluate('window.__feiAGPatch?.dispose()').catch(() => {});
@@ -472,7 +476,9 @@ async function sync() {
           lastLocalPath: '/',
           lastRemotePath: '/',
           signature: '',
+          bundleSource: '',
           scriptId: null,
+          navTimer: null,
           lastMetricsCascade: '',
           lastMetricsSig: '',
           lastMetricsLimit: 0,
@@ -503,13 +509,21 @@ async function sync() {
             session.targetUrl = params?.frame?.url || session.targetUrl;
             rememberSessionPath(session, session.targetUrl);
             if (!session.scriptId) session.signature = '';
-            for (const delay of [80, 350]) {
-              setTimeout(() => {
-                if (!session.client.open) return;
-                session.client.evaluate(bundle.source).catch(() => {});
-                pushSshStateToSession(session, getSshState(), true);
-              }, delay);
-            }
+            if (session.navTimer) clearTimeout(session.navTimer);
+            session.navTimer = setTimeout(async () => {
+              session.navTimer = null;
+              if (!session.client.open) return;
+              const src = session.bundleSource || bundle.source;
+              if (session.scriptId) {
+                const hasPatch = await session.client.evaluate('Boolean(window.__feiAGPatch)').catch(() => false);
+                if (!hasPatch) {
+                  await session.client.evaluate(src).catch(() => {});
+                }
+              } else {
+                await session.client.evaluate(src).catch(() => {});
+              }
+              await pushSshStateToSession(session, getSshState(), true);
+            }, 120);
           }
         });
         await backup(client).catch(() => {});
@@ -529,6 +543,7 @@ async function sync() {
         if (session.scriptId) await session.client.call('Page.removeScriptToEvaluateOnNewDocument', {identifier: session.scriptId}).catch(() => {});
         const result = await session.client.call('Page.addScriptToEvaluateOnNewDocument', {source: bundle.source});
         session.scriptId = result.identifier;
+        session.bundleSource = bundle.source;
         await session.client.evaluate(bundle.source);
         await pushSshStateToSession(session, getSshState(), true);
         session.signature = bundle.signature;

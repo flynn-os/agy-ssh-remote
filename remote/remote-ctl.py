@@ -17,16 +17,22 @@ Manages:
 """
 
 import base64
+import fcntl
+import glob
+import hmac
 import http.server
 import io
 import json
+import mmap
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
 import sqlite3
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -39,10 +45,67 @@ import uuid
 import zipfile
 
 WEB_BUNDLE_PATCH_VERSION = "20261106-ssh-v11"
-BRIDGE_DAEMON_VERSION = "20261114-ssh-v16"
+BRIDGE_DAEMON_VERSION = "20261118-ssh-v17"
 DEFAULT_HTTPS_PORT = 58282
 DEFAULT_HTTP_PORT = 58283
 DEFAULT_BRIDGE_PORT = 58284
+SERVER_LOG_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _write_json_0600(path, data, indent=None):
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        payload = json.dumps(data, indent=indent).encode("utf-8")
+        view = memoryview(payload)
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, view[written:])
+    except Exception:
+        os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    os.replace(tmp_path, path)
+
+
+def _open_log_0600(log_path):
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    return fd
+
+
+def _is_valid_bridge_token(tok):
+    return isinstance(tok, str) and bool(re.fullmatch(r"[0-9a-f]{64}", tok))
+
+
+def _resolve_expected_bridge_token():
+    env_tok = os.environ.get("AG_BRIDGE_TOKEN") or ""
+    if env_tok:
+        return env_tok
+    if os.environ.get("AG_BRIDGE_RELAY_ONLY") == "1":
+        return None
+    run_dir = os.path.join(os.path.expanduser("~"), ".antigravity-server", "run")
+    state_file = os.path.join(run_dir, "bridge.json")
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        tok = st.get("bridgeToken")
+        if isinstance(tok, str) and tok:
+            return tok
+    except Exception:
+        pass
+    return ""
 
 
 def _child_env():
@@ -256,18 +319,27 @@ def ensure_patched_web_bundle(bin_path):
             pass
 
     with open(bin_path, "rb") as f:
-        data = f.read()
+        file_size = os.fstat(f.fileno()).st_size
+        if file_size <= 0:
+            raise RuntimeError("Could not locate embedded web bundle in language_server binary")
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            idx = mm.find(b"compiled_tailwind.css")
+            if idx < 0:
+                raise RuntimeError("Could not locate embedded web bundle in language_server binary")
+            idx_cd = mm.find(b"PK\x01\x02", idx)
+            if idx_cd < 0:
+                raise RuntimeError("Could not locate embedded web bundle central directory")
+            idx_eocd = mm.find(b"PK\x05\x06", idx_cd)
+            if idx_eocd < 0 or idx_eocd + 22 > file_size:
+                raise RuntimeError("Could not locate embedded web bundle EOCD")
+            cd_size, cd_offset, comment_len = struct.unpack("<IIH", mm[idx_eocd + 12 : idx_eocd + 22])
+            zip_start = idx_cd - cd_offset
+            zip_end = idx_eocd + 22 + comment_len
+            if zip_start < 0 or zip_end > file_size or zip_start >= zip_end:
+                raise RuntimeError("Invalid embedded web bundle bounds")
+            zip_bytes = bytes(mm[zip_start:zip_end])
 
-    idx = data.find(b"compiled_tailwind.css")
-    if idx < 0:
-        raise RuntimeError("Could not locate embedded web bundle in language_server binary")
-    idx_cd = data.find(b"PK\x01\x02", idx)
-    idx_eocd = data.find(b"PK\x05\x06", idx_cd)
-    cd_size, cd_offset, comment_len = struct.unpack("<IIH", data[idx_eocd + 12 : idx_eocd + 22])
-    zip_start = idx_cd - cd_offset
-    zip_end = idx_eocd + 22 + comment_len
-
-    src_zf = zipfile.ZipFile(io.BytesIO(data[zip_start:zip_end]), "r")
+    src_zf = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
     buf = io.BytesIO()
 
     inject_head = """<script>
@@ -391,9 +463,9 @@ def check_bridge_alive(port):
 
 def is_port_free(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("127.0.0.1", port))
+            s.listen(1)
             return True
         except OSError:
             return False
@@ -462,19 +534,46 @@ def kill_existing_ls(run_dir):
         time.sleep(0.1)
 
 
+_OPEN_URLS_LOCK = threading.Lock()
+_OPEN_URLS_CACHE = {}
+
+
 def extract_open_urls(log_path):
-    urls = []
-    if not os.path.isfile(log_path):
-        return urls
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                m = re.search(r"ANTIGRAVITY_OPEN_URL:\s*(\S+)", line)
-                if m:
-                    urls.append(m.group(1))
-    except Exception:
-        pass
-    return urls
+    with _OPEN_URLS_LOCK:
+        try:
+            st = os.stat(log_path)
+        except OSError:
+            _OPEN_URLS_CACHE.pop(log_path, None)
+            return []
+        if not stat.S_ISREG(st.st_mode):
+            _OPEN_URLS_CACHE.pop(log_path, None)
+            return []
+
+        cached = _OPEN_URLS_CACHE.get(log_path)
+        if cached is None or cached[0] != st.st_ino or st.st_size < cached[1]:
+            last_offset = 0
+            urls = []
+        else:
+            last_offset = cached[1]
+            urls = list(cached[2])
+
+        if st.st_size == last_offset:
+            _OPEN_URLS_CACHE[log_path] = (st.st_ino, last_offset, urls)
+            return list(urls)
+
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(last_offset)
+                for raw_line in f:
+                    line = raw_line.decode("utf-8", errors="ignore")
+                    m = re.search(r"ANTIGRAVITY_OPEN_URL:\s*(\S+)", line)
+                    if m:
+                        urls.append(m.group(1))
+                new_offset = f.tell()
+            _OPEN_URLS_CACHE[log_path] = (st.st_ino, new_offset, urls)
+        except Exception:
+            pass
+        return list(urls)
 
 
 def ensure_bridge_daemon(run_dir, preferred_port=DEFAULT_BRIDGE_PORT):
@@ -486,9 +585,19 @@ def ensure_bridge_daemon(run_dir, preferred_port=DEFAULT_BRIDGE_PORT):
             b_pid = st.get("pid")
             b_port = st.get("port")
             b_ver = st.get("version")
-            if b_ver == BRIDGE_DAEMON_VERSION and is_pid_alive(b_pid, "bridge-daemon"):
+            b_tok = st.get("bridgeToken")
+            if (
+                b_ver == BRIDGE_DAEMON_VERSION
+                and _is_valid_bridge_token(b_tok)
+                and is_pid_alive(b_pid, "bridge-daemon")
+            ):
                 if b_pid == os.getpid() or check_bridge_alive(b_port):
-                    return b_port
+                    try:
+                        if (os.stat(state_file).st_mode & 0o777) != 0o600:
+                            os.chmod(state_file, 0o600)
+                    except OSError:
+                        pass
+                    return b_port, b_tok
         except Exception:
             pass
 
@@ -534,31 +643,40 @@ def ensure_bridge_daemon(run_dir, preferred_port=DEFAULT_BRIDGE_PORT):
         time.sleep(0.08)
 
     port = pick_port(preferred_port)
+    bridge_token = secrets.token_hex(32)
     script_path = os.path.abspath(__file__)
     if not os.path.isfile(script_path) or script_path.endswith("<stdin>"):
         script_path = os.path.expanduser("~/.antigravity-server/bin/ag-remote-ctl.py")
     log_path = os.path.join(run_dir, "bridge.log")
-    log_fd = open(log_path, "w", encoding="utf-8")
-    proc = subprocess.Popen(
-        [sys.executable, script_path, "bridge-daemon", str(port)],
-        stdin=subprocess.DEVNULL,
-        stdout=log_fd,
-        stderr=subprocess.STDOUT,
-        env=_child_env(),
-        start_new_session=True,
-        close_fds=True,
-    )
-    log_fd.close()
+    raw_log_fd = _open_log_0600(log_path)
+    try:
+        child_env = _child_env()
+        child_env["AG_BRIDGE_TOKEN"] = bridge_token
+        proc = subprocess.Popen(
+            [sys.executable, script_path, "bridge-daemon", str(port)],
+            stdin=subprocess.DEVNULL,
+            stdout=raw_log_fd,
+            stderr=subprocess.STDOUT,
+            env=child_env,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        os.close(raw_log_fd)
 
     deadline = time.time() + 5.0
     while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"bridge-daemon exited early with code {proc.returncode}")
         if check_bridge_alive(port):
             break
         time.sleep(0.1)
 
-    with open(state_file, "w", encoding="utf-8") as f:
-        json.dump({"pid": proc.pid, "port": port, "version": BRIDGE_DAEMON_VERSION}, f)
-    return port
+    _write_json_0600(
+        state_file,
+        {"pid": proc.pid, "port": port, "version": BRIDGE_DAEMON_VERSION, "bridgeToken": bridge_token},
+    )
+    return port, bridge_token
 
 
 def get_status_dict():
@@ -608,7 +726,6 @@ def ensure_server(version, execution_id, force_restart=False):
     sanitize_git_worktree_configs()
     sync_cli_store()
     env = load_user_env()
-    has_auth = ensure_auth_token()
     home = os.path.expanduser("~")
     run_dir = os.path.join(home, ".antigravity-server", "run")
     os.makedirs(run_dir, mode=0o700, exist_ok=True)
@@ -618,155 +735,181 @@ def ensure_server(version, execution_id, force_restart=False):
         pass
     state_file = os.path.join(run_dir, "server.json")
     log_path = os.path.join(run_dir, "server.log")
-
-    bin_path = ensure_binary(version, execution_id, env)
-    zip_path = ensure_patched_web_bundle(bin_path)
-    bridge_port = ensure_bridge_daemon(run_dir, DEFAULT_BRIDGE_PORT)
-
-    prev_state = {}
-    if os.path.isfile(state_file):
+    lock_path = os.path.join(run_dir, "install.lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
         try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                prev_state = json.load(f)
-        except Exception:
-            prev_state = {}
+            os.fchmod(lock_fd, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            has_auth = ensure_auth_token()
+            bin_path = ensure_binary(version, execution_id, env)
+            zip_path = ensure_patched_web_bundle(bin_path)
+            bridge_port, bridge_token = ensure_bridge_daemon(run_dir, DEFAULT_BRIDGE_PORT)
 
-    if not force_restart and prev_state:
-        pid = prev_state.get("pid")
-        https_port = prev_state.get("httpsPort")
-        http_port = prev_state.get("httpPort")
-        csrf_token = prev_state.get("csrfToken")
-        if (
-            prev_state.get("version") == version
-            and prev_state.get("webBundleVersion") == WEB_BUNDLE_PATCH_VERSION
-            and is_pid_alive_ls(pid)
-            and check_https_alive(https_port, csrf_token)
-        ):
-            if prev_state.get("bridgePort") != bridge_port:
-                prev_state["bridgePort"] = bridge_port
-                with open(state_file, "w", encoding="utf-8") as f:
-                    json.dump(prev_state, f, indent=2)
+            prev_state = {}
+            if os.path.isfile(state_file):
+                try:
+                    with open(state_file, "r", encoding="utf-8") as f:
+                        prev_state = json.load(f)
+                except Exception:
+                    prev_state = {}
+
+            if not force_restart and prev_state:
+                pid = prev_state.get("pid")
+                https_port = prev_state.get("httpsPort")
+                http_port = prev_state.get("httpPort")
+                csrf_token = prev_state.get("csrfToken")
+                if (
+                    prev_state.get("version") == version
+                    and prev_state.get("webBundleVersion") == WEB_BUNDLE_PATCH_VERSION
+                    and is_pid_alive_ls(pid)
+                    and check_https_alive(https_port, csrf_token)
+                ):
+                    if prev_state.get("bridgePort") != bridge_port:
+                        prev_state["bridgePort"] = bridge_port
+                        _write_json_0600(state_file, prev_state, indent=2)
+                    return {
+                        "ok": True,
+                        "reused": True,
+                        "hostname": socket.gethostname(),
+                        "arch": os.uname().machine,
+                        "homeDir": home,
+                        "hasAuth": has_auth,
+                        "pid": pid,
+                        "version": version,
+                        "httpsPort": https_port,
+                        "httpPort": http_port,
+                        "bridgePort": bridge_port,
+                        "bridgeToken": bridge_token,
+                        "csrfToken": csrf_token,
+                        "openUrls": extract_open_urls(log_path),
+                    }
+
+            # Per-install random token. Older versions fell back to a fixed, publicly known constant;
+            # replace that one if it is still in the saved state.
+            csrf_token = prev_state.get("csrfToken") or ""
+            if not csrf_token or csrf_token == "fe9a2c44-8811-4b22-9933-aabbccddeeff":
+                csrf_token = str(uuid.uuid4())
+            kill_existing_ls(run_dir)
+
+            https_port = pick_port(DEFAULT_HTTPS_PORT)
+            http_port = pick_port(DEFAULT_HTTP_PORT if DEFAULT_HTTP_PORT != https_port else DEFAULT_HTTP_PORT + 1)
+
+            args = [
+                bin_path,
+                "--standalone",
+                "--override_ide_name",
+                "antigravity",
+                "--subclient_type",
+                "hub",
+                "--override_ide_version",
+                version,
+                "--override_user_agent_name",
+                "antigravity",
+                "--https_server_port",
+                str(https_port),
+                "--http_server_port",
+                str(http_port),
+                "--csrf_token",
+                csrf_token,
+                "--app_data_dir",
+                "antigravity",
+                "--api_server_url",
+                "https://generativelanguage.googleapis.com",
+                "--cloud_code_endpoint",
+                "https://daily-cloudcode-pa.googleapis.com",
+                "--enable_sidecars",
+                "--enable_lsp=true",
+                "--remote_agent_fastpush_override=false",
+                "--web_bundle_path",
+                zip_path,
+            ]
+
+            try:
+                if os.path.isfile(log_path) and os.path.getsize(log_path) > SERVER_LOG_MAX_BYTES:
+                    rotated_path = log_path + ".1"
+                    os.replace(log_path, rotated_path)
+                    try:
+                        os.chmod(rotated_path, 0o600)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+
+            raw_log_fd = _open_log_0600(log_path)
+            try:
+                proc = subprocess.Popen(
+                    args,
+                    stdin=subprocess.DEVNULL,
+                    stdout=raw_log_fd,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            finally:
+                os.close(raw_log_fd)
+
+            actual_https = None
+            actual_http = None
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"language_server exited early with code {proc.returncode}")
+                if os.path.isfile(log_path):
+                    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                        log_text = f.read()
+                    m_s = re.search(r"listening on \w+ port at (\d+) for HTTPS\b", log_text, re.I)
+                    m_h = re.search(r"listening on \w+ port at (\d+) for HTTP\b", log_text, re.I)
+                    if m_s:
+                        actual_https = int(m_s.group(1))
+                    if m_h:
+                        actual_http = int(m_h.group(1))
+                    if actual_https and check_https_alive(actual_https, csrf_token):
+                        break
+                time.sleep(0.2)
+
+            if not actual_https:
+                raise RuntimeError("Timed out waiting for remote language_server HTTPS port")
+
+            state = {
+                "pid": proc.pid,
+                "version": version,
+                "webBundleVersion": WEB_BUNDLE_PATCH_VERSION,
+                "httpsPort": actual_https,
+                "httpPort": actual_http or http_port,
+                "bridgePort": bridge_port,
+                "csrfToken": csrf_token,
+                "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            _write_json_0600(state_file, state, indent=2)
+
             return {
                 "ok": True,
-                "reused": True,
+                "reused": False,
                 "hostname": socket.gethostname(),
                 "arch": os.uname().machine,
                 "homeDir": home,
                 "hasAuth": has_auth,
-                "pid": pid,
+                "pid": proc.pid,
                 "version": version,
-                "httpsPort": https_port,
-                "httpPort": http_port,
+                "httpsPort": actual_https,
+                "httpPort": actual_http or http_port,
                 "bridgePort": bridge_port,
+                "bridgeToken": bridge_token,
                 "csrfToken": csrf_token,
                 "openUrls": extract_open_urls(log_path),
             }
-
-    # Per-install random token. Older versions fell back to a fixed, publicly known constant;
-    # replace that one if it is still in the saved state.
-    csrf_token = prev_state.get("csrfToken") or ""
-    if not csrf_token or csrf_token == "fe9a2c44-8811-4b22-9933-aabbccddeeff":
-        csrf_token = str(uuid.uuid4())
-    kill_existing_ls(run_dir)
-
-    https_port = pick_port(DEFAULT_HTTPS_PORT)
-    http_port = pick_port(DEFAULT_HTTP_PORT if DEFAULT_HTTP_PORT != https_port else DEFAULT_HTTP_PORT + 1)
-
-    args = [
-        bin_path,
-        "--standalone",
-        "--override_ide_name",
-        "antigravity",
-        "--subclient_type",
-        "hub",
-        "--override_ide_version",
-        version,
-        "--override_user_agent_name",
-        "antigravity",
-        "--https_server_port",
-        str(https_port),
-        "--http_server_port",
-        str(http_port),
-        "--csrf_token",
-        csrf_token,
-        "--app_data_dir",
-        "antigravity",
-        "--api_server_url",
-        "https://generativelanguage.googleapis.com",
-        "--cloud_code_endpoint",
-        "https://daily-cloudcode-pa.googleapis.com",
-        "--enable_sidecars",
-        "--enable_lsp=true",
-        "--remote_agent_fastpush_override=false",
-        "--web_bundle_path",
-        zip_path,
-    ]
-
-    log_fd = open(log_path, "w", encoding="utf-8")
-    proc = subprocess.Popen(
-        args,
-        stdin=subprocess.DEVNULL,
-        stdout=log_fd,
-        stderr=subprocess.STDOUT,
-        env=env,
-        start_new_session=True,
-        close_fds=True,
-    )
-    log_fd.close()
-
-    actual_https = None
-    actual_http = None
-    deadline = time.time() + 20.0
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f"language_server exited early with code {proc.returncode}")
-        if os.path.isfile(log_path):
-            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-                log_text = f.read()
-            m_s = re.search(r"listening on \w+ port at (\d+) for HTTPS\b", log_text, re.I)
-            m_h = re.search(r"listening on \w+ port at (\d+) for HTTP\b", log_text, re.I)
-            if m_s:
-                actual_https = int(m_s.group(1))
-            if m_h:
-                actual_http = int(m_h.group(1))
-            if actual_https and check_https_alive(actual_https, csrf_token):
-                break
-        time.sleep(0.2)
-
-    if not actual_https:
-        raise RuntimeError("Timed out waiting for remote language_server HTTPS port")
-
-    state = {
-        "pid": proc.pid,
-        "version": version,
-        "webBundleVersion": WEB_BUNDLE_PATCH_VERSION,
-        "httpsPort": actual_https,
-        "httpPort": actual_http or http_port,
-        "bridgePort": bridge_port,
-        "csrfToken": csrf_token,
-        "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    tmp_state = state_file + f".tmp.{os.getpid()}"
-    with open(tmp_state, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-    os.chmod(tmp_state, 0o600)
-    os.replace(tmp_state, state_file)
-
-    return {
-        "ok": True,
-        "reused": False,
-        "hostname": socket.gethostname(),
-        "arch": os.uname().machine,
-        "homeDir": home,
-        "hasAuth": has_auth,
-        "pid": proc.pid,
-        "version": version,
-        "httpsPort": actual_https,
-        "httpPort": actual_http or http_port,
-        "bridgePort": bridge_port,
-        "csrfToken": csrf_token,
-        "openUrls": extract_open_urls(log_path),
-    }
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(lock_fd)
 
 
 def decode_pbtxt_string(raw_str):
@@ -823,6 +966,7 @@ def load_deleted_conversations():
         return set()
 
 
+_cli_sync_lock = threading.RLock()
 _CLI_SYNC_STATE = {
     "last_sync_sig": "",
     "last_summaries_sig": "",
@@ -864,39 +1008,46 @@ def _compute_cli_store_sig():
 def delete_cli_conversation(cid):
     if not cid or not re.match(r"^[0-9a-f-]{36}$", str(cid), re.I):
         return {"ok": False, "error": "Invalid conversation ID"}
-    _CLI_SYNC_STATE["last_sync_sig"] = ""
-    _CLI_SYNC_STATE["last_summaries_sig"] = ""
-    _CLI_SYNC_STATE["cached_summaries_res"] = None
-    deleted = load_deleted_conversations()
-    deleted.add(cid)
-    try:
-        with open(_deleted_tombstones_path(), "w", encoding="utf-8") as f:
-            json.dump(sorted(deleted), f)
-    except Exception:
-        pass
-    home = os.path.expanduser("~")
-    for store_name in ["antigravity-cli", "antigravity"]:
-        root = os.path.join(home, ".gemini", store_name)
-        for ext in [".db", ".db-wal", ".db-shm", ".pb"]:
-            p = os.path.join(root, "conversations", f"{cid}{ext}")
-            try:
-                if os.path.islink(p) or os.path.isfile(p):
-                    os.unlink(p)
-            except Exception:
-                pass
-        db_path = os.path.join(root, "conversation_summaries.db")
-        if os.path.isfile(db_path):
-            try:
-                conn = sqlite3.connect(db_path, timeout=2.0)
-                conn.execute("DELETE FROM conversation_summaries WHERE conversation_id = ?", (cid,))
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
-    return {"ok": True, "deletedId": cid}
+    with _cli_sync_lock:
+        _CLI_SYNC_STATE["last_sync_sig"] = ""
+        _CLI_SYNC_STATE["last_summaries_sig"] = ""
+        _CLI_SYNC_STATE["cached_summaries_res"] = None
+        _CLI_SYNC_STATE["metrics_row_cache"].pop(cid, None)
+        deleted = load_deleted_conversations()
+        deleted.add(cid)
+        try:
+            with open(_deleted_tombstones_path(), "w", encoding="utf-8") as f:
+                json.dump(sorted(deleted), f)
+        except Exception:
+            pass
+        home = os.path.expanduser("~")
+        for store_name in ["antigravity-cli", "antigravity"]:
+            root = os.path.join(home, ".gemini", store_name)
+            for ext in [".db", ".db-wal", ".db-shm", ".pb"]:
+                p = os.path.join(root, "conversations", f"{cid}{ext}")
+                try:
+                    if os.path.islink(p) or os.path.isfile(p):
+                        os.unlink(p)
+                except Exception:
+                    pass
+            db_path = os.path.join(root, "conversation_summaries.db")
+            if os.path.isfile(db_path):
+                try:
+                    conn = sqlite3.connect(db_path, timeout=2.0)
+                    conn.execute("DELETE FROM conversation_summaries WHERE conversation_id = ?", (cid,))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+        return {"ok": True, "deletedId": cid}
 
 
 def sync_cli_store():
+    with _cli_sync_lock:
+        return _sync_cli_store_unlocked()
+
+
+def _sync_cli_store_unlocked():
     home = os.path.expanduser("~")
     cli_root = os.path.join(home, ".gemini", "antigravity-cli")
     app_root = os.path.join(home, ".gemini", "antigravity")
@@ -1009,36 +1160,42 @@ def sync_cli_store():
 def _expand_remote_workspace_uris(ws_uris):
     out = []
     seen = set()
-    rp_cache = _CLI_SYNC_STATE["realpath_cache"]
-    for raw_u in ws_uris or []:
-        if not isinstance(raw_u, str):
-            continue
-        clean = raw_u.rstrip("/")
-        if not clean:
-            continue
-        if clean not in seen:
-            seen.add(clean)
-            out.append(clean)
-        if clean.startswith("file:///"):
-            fs_path = urllib.parse.unquote(clean[7:])
-            try:
-                real_p = rp_cache.get(fs_path)
-                if real_p is None:
-                    real_p = os.path.realpath(fs_path).rstrip("/")
-                    if len(rp_cache) > 512:
-                        rp_cache.clear()
-                    rp_cache[fs_path] = real_p
-                if real_p and real_p != fs_path:
-                    real_u = f"file://{real_p}"
-                    if real_u not in seen:
-                        seen.add(real_u)
-                        out.append(real_u)
-            except Exception:
-                pass
+    with _cli_sync_lock:
+        rp_cache = _CLI_SYNC_STATE["realpath_cache"]
+        for raw_u in ws_uris or []:
+            if not isinstance(raw_u, str):
+                continue
+            clean = raw_u.rstrip("/")
+            if not clean:
+                continue
+            if clean not in seen:
+                seen.add(clean)
+                out.append(clean)
+            if clean.startswith("file:///"):
+                fs_path = urllib.parse.unquote(clean[7:])
+                try:
+                    real_p = rp_cache.get(fs_path)
+                    if real_p is None:
+                        real_p = os.path.realpath(fs_path).rstrip("/")
+                        if len(rp_cache) > 512:
+                            rp_cache.clear()
+                        rp_cache[fs_path] = real_p
+                    if real_p and real_p != fs_path:
+                        real_u = f"file://{real_p}"
+                        if real_u not in seen:
+                            seen.add(real_u)
+                            out.append(real_u)
+                except Exception:
+                    pass
     return out
 
 
 def get_cli_summaries(client_sig=""):
+    with _cli_sync_lock:
+        return _get_cli_summaries_unlocked(client_sig)
+
+
+def _get_cli_summaries_unlocked(client_sig=""):
     sync_cli_store()
     cur_sig = _compute_cli_store_sig()
     if (
@@ -1265,8 +1422,9 @@ def read_conversation_raw(cascade_id, client_sig="", after_idx=-1):
         if client_sig and client_sig == sig:
             return {"ok": True, "cascadeId": cascade_id, "hasData": True, "unchanged": True, "sig": sig}
 
-        m_cache = _CLI_SYNC_STATE["metrics_row_cache"]
-        cached_entry = m_cache.get(cascade_id)
+        with _cli_sync_lock:
+            m_cache = _CLI_SYNC_STATE["metrics_row_cache"]
+            cached_entry = m_cache.get(cascade_id)
         if not cached_entry or cached_entry.get("sig") != sig:
             prev_rows_map = cached_entry.get("rows_map", {}) if cached_entry else {}
             prev_max_idx = max(prev_rows_map.keys()) if prev_rows_map else -1
@@ -1289,15 +1447,17 @@ def read_conversation_raw(cascade_id, client_sig="", after_idx=-1):
             cur.execute("SELECT idx FROM steps WHERE step_type = 15 ORDER BY idx ASC")
             planner_steps = [r[0] for r in cur.fetchall()]
             conn.close()
-            if len(m_cache) > 64:
-                m_cache.clear()
             cached_entry = {
                 "sig": sig,
                 "rows_map": rows_map,
                 "user_steps": user_steps,
                 "planner_steps": planner_steps,
             }
-            m_cache[cascade_id] = cached_entry
+            with _cli_sync_lock:
+                m_cache = _CLI_SYNC_STATE["metrics_row_cache"]
+                if len(m_cache) > 64:
+                    m_cache.clear()
+                m_cache[cascade_id] = cached_entry
 
         rows_map = cached_entry["rows_map"]
         all_sorted_keys = sorted(rows_map.keys())
@@ -1321,6 +1481,30 @@ def read_conversation_raw(cascade_id, client_sig="", after_idx=-1):
         return {"ok": False, "cascadeId": cascade_id, "hasData": False, "error": str(e)}
 
 
+def _strip_worktree_config_extension(txt):
+    if "worktreeConfig" not in txt:
+        return txt
+    new_txt = re.sub(
+        r"\n?\[extensions\][ \t]*\r?\n[ \t]*worktreeConfig[ \t]*=[ \t]*true[ \t]*(?=\r?\n(?:[ \t]*\r?\n)*(?:\[|$)|$)\r?\n?",
+        "\n",
+        txt,
+    )
+    if new_txt != txt:
+        return new_txt
+    out_lines = []
+    in_ext = False
+    changed = False
+    for line in txt.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_ext = stripped.lower() == "[extensions]"
+        elif in_ext and re.match(r"^[ \t]*worktreeConfig[ \t]*=[ \t]*true[ \t]*$", line.rstrip("\r\n")):
+            changed = True
+            continue
+        out_lines.append(line)
+    return "".join(out_lines) if changed else txt
+
+
 def sanitize_git_worktree_configs():
     for base_root in ["/develop", os.path.expanduser("~")]:
         if not os.path.isdir(base_root):
@@ -1334,21 +1518,51 @@ def sanitize_git_worktree_configs():
                 if os.path.isdir(sub):
                     candidates.append(sub)
             for root in candidates:
-                for name in os.listdir(root):
+                try:
+                    names = os.listdir(root)
+                except OSError:
+                    continue
+                for name in names:
                     if name.startswith(".") and name != ".git":
                         continue
                     repo_dir = root if name == ".git" else os.path.join(root, name)
                     git_dir = os.path.join(repo_dir, ".git")
                     cfg_path = os.path.join(git_dir, "config")
                     wt_cfg = os.path.join(git_dir, "config.worktree")
-                    if os.path.isfile(cfg_path) and not os.path.exists(wt_cfg):
-                        with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
-                            txt = f.read()
-                        if "worktreeConfig" in txt:
-                            new_txt = re.sub(r"\n?\[extensions\]\s*\n\s*worktreeConfig\s*=\s*true\s*\n?", "\n", txt)
+                    tmp_cfg = None
+                    try:
+                        has_wt_cfg = os.path.exists(wt_cfg) or bool(
+                            glob.glob(os.path.join(git_dir, "worktrees", "*", "config.worktree"))
+                        )
+                        if os.path.isfile(cfg_path) and not has_wt_cfg:
+                            with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                                txt = f.read()
+                            new_txt = _strip_worktree_config_extension(txt)
                             if new_txt != txt:
-                                with open(cfg_path, "w", encoding="utf-8") as f:
-                                    f.write(new_txt)
+                                orig_mode = stat.S_IMODE(os.stat(cfg_path).st_mode)
+                                tmp_cfg = os.path.join(
+                                    git_dir, f".config.tmp.{os.getpid()}.{threading.get_ident()}"
+                                )
+                                fd = os.open(tmp_cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, orig_mode)
+                                try:
+                                    try:
+                                        os.fchmod(fd, orig_mode)
+                                    except OSError:
+                                        pass
+                                    payload = new_txt.encode("utf-8")
+                                    view = memoryview(payload)
+                                    written = 0
+                                    while written < len(payload):
+                                        written += os.write(fd, view[written:])
+                                finally:
+                                    os.close(fd)
+                                os.replace(tmp_cfg, cfg_path)
+                    except Exception:
+                        if tmp_cfg and os.path.exists(tmp_cfg):
+                            try:
+                                os.unlink(tmp_cfg)
+                            except OSError:
+                                pass
         except Exception:
             pass
 
@@ -1812,12 +2026,30 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _check_bridge_auth(self):
+        expected = _resolve_expected_bridge_token()
+        if expected is None:
+            return True
+        provided = self.headers.get("X-Ag-Bridge-Token") or ""
+        if (
+            not expected
+            or not provided
+            or not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+        ):
+            self.close_connection = True
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return False
+        return True
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
         if parsed.path == "/ping":
             self._send_json(200, {"ok": True, "ts": int(time.time() * 1000), "hostname": socket.gethostname()})
-        elif parsed.path == "/status":
+            return
+        if not self._check_bridge_auth():
+            return
+        if parsed.path == "/status":
             self._send_json(200, get_status_dict())
         elif parsed.path == "/metrics":
             cid = (qs.get("cascadeId") or [""])[0]
@@ -1839,6 +2071,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": "Not found"})
 
     def do_POST(self):
+        if not self._check_bridge_auth():
+            return
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/relay/stream":
             handle_relay_stream(self)

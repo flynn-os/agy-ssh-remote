@@ -31,23 +31,106 @@ export const RELAY_DEFAULTS = {
   backoffMaxMs: 5000,
 };
 
+function detachIfOversized(buf) {
+  if (buf.length > 0 && buf.buffer.byteLength > 65536 && buf.length * 4 <= buf.buffer.byteLength) {
+    return Buffer.from(buf);
+  }
+  return buf;
+}
+
 export class RecordParser {
   constructor() {
-    this.buf = Buffer.alloc(0);
+    this.chunks = [];
+    this.totalLen = 0;
+  }
+
+  _peekHeader() {
+    const first = this.chunks[0];
+    if (first.length >= REC_HEADER_LEN) {
+      return {
+        type: first[0],
+        seq: Number(first.readBigUInt64BE(1)),
+        len: first.readUInt32BE(9),
+      };
+    }
+    const hdr = Buffer.allocUnsafe(REC_HEADER_LEN);
+    let filled = 0;
+    for (let i = 0; i < this.chunks.length && filled < REC_HEADER_LEN; i++) {
+      const c = this.chunks[i];
+      const take = Math.min(c.length, REC_HEADER_LEN - filled);
+      c.copy(hdr, filled, 0, take);
+      filled += take;
+    }
+    return {
+      type: hdr[0],
+      seq: Number(hdr.readBigUInt64BE(1)),
+      len: hdr.readUInt32BE(9),
+    };
   }
 
   push(chunk) {
-    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+    if (!chunk || chunk.length === 0) return [];
+    const bufChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    this.chunks.push(bufChunk);
+    this.totalLen += bufChunk.length;
+
     const out = [];
-    while (this.buf.length >= REC_HEADER_LEN) {
-      const type = this.buf[0];
-      const seq = Number(this.buf.readBigUInt64BE(1));
-      const len = this.buf.readUInt32BE(9);
-      if (this.buf.length < REC_HEADER_LEN + len) break;
-      const payload = this.buf.subarray(REC_HEADER_LEN, REC_HEADER_LEN + len);
-      this.buf = this.buf.subarray(REC_HEADER_LEN + len);
+    let active = null;
+    let offset = 0;
+
+    while (this.totalLen >= REC_HEADER_LEN) {
+      let type, seq, len;
+      if (active) {
+        if (active.length - offset < REC_HEADER_LEN) break;
+        type = active[offset];
+        seq = Number(active.readBigUInt64BE(offset + 1));
+        len = active.readUInt32BE(offset + 9);
+      } else {
+        ({type, seq, len} = this._peekHeader());
+      }
+
+      const frameSize = REC_HEADER_LEN + len;
+      if (this.totalLen < frameSize) break;
+
+      if (!active) {
+        if (this.chunks.length === 1) {
+          active = this.chunks[0];
+        } else if (this.chunks[0].length >= frameSize) {
+          const first = this.chunks[0];
+          const payload = first.subarray(REC_HEADER_LEN, frameSize);
+          out.push({type, seq, payload});
+          if (first.length === frameSize) {
+            this.chunks.shift();
+          } else {
+            this.chunks[0] = first.subarray(frameSize);
+          }
+          this.totalLen -= frameSize;
+          continue;
+        } else {
+          active = Buffer.concat(this.chunks, this.totalLen);
+          this.chunks = [active];
+        }
+        offset = 0;
+      }
+
+      const payload = active.subarray(offset + REC_HEADER_LEN, offset + frameSize);
       out.push({type, seq, payload});
+      offset += frameSize;
+      this.totalLen -= frameSize;
     }
+
+    if (active) {
+      if (this.totalLen === 0) {
+        this.chunks = [];
+      } else {
+        this.chunks = [detachIfOversized(active.subarray(offset))];
+      }
+    } else if (this.totalLen === 0) {
+      this.chunks = [];
+    } else if (this.chunks.length > 0) {
+      this.chunks[0] = detachIfOversized(this.chunks[0]);
+    }
+
     return out;
   }
 }
@@ -98,7 +181,7 @@ function parseJson(buf) {
 
 /**
  * @param {object} opts
- * @param {() => {host: string, port: number} | null} opts.getBridge  current bridge address, or null while disconnected
+ * @param {() => {host: string, port: number, token?: string} | null} opts.getBridge  current bridge address, or null while disconnected
  * @param {(fn: () => void) => () => void} [opts.onReconnected]  subscribe to "tunnel is back" to retry immediately
  * @param {{path: string, headers: object, body: Buffer}} opts.request  the original RPC
  * @param {{writeHead(status:number, headers:object):void, write(buf:Buffer):void, end():void}} opts.sink
@@ -149,6 +232,10 @@ export class ResumableRelayStream {
   closeRemote() {
     const bridge = this.getBridge();
     if (!bridge) return;
+    const headers = {'content-length': '0'};
+    if (typeof bridge.token === 'string' && bridge.token.length > 0) {
+      headers['x-ag-bridge-token'] = bridge.token;
+    }
     const req = http.request({
       host: bridge.host,
       port: bridge.port,
@@ -156,7 +243,7 @@ export class ResumableRelayStream {
       path: `/relay/close?id=${this.id}`,
       agent: false,
       timeout: 5000,
-      headers: {'content-length': '0'},
+      headers,
     });
     req.on('error', () => {});
     req.on('timeout', () => req.destroy());
@@ -193,13 +280,17 @@ export class ResumableRelayStream {
     const c = {req: null, parser: new RecordParser(), gotMeta: false, dead: false, stallTimer: null, attachTimer: null, replayed: 0, startedAt: Date.now()};
     this.conns.add(c);
     this.stats.attaches += 1;
+    const headers = {'content-type': 'application/json', 'content-length': String(body.length)};
+    if (typeof bridge.token === 'string' && bridge.token.length > 0) {
+      headers['x-ag-bridge-token'] = bridge.token;
+    }
     const req = http.request({
       host: bridge.host,
       port: bridge.port,
       method: 'POST',
       path: '/relay/stream',
       agent: false,
-      headers: {'content-type': 'application/json', 'content-length': String(body.length)},
+      headers,
     });
     c.req = req;
     c.attachTimer = setTimeout(() => this.attachInParallel(c, `no META after ${this.cfg.attachTimeoutMs}ms`), this.cfg.attachTimeoutMs);

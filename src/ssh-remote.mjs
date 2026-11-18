@@ -1,4 +1,5 @@
 import {execFile, spawn, spawnSync} from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import http2 from 'node:http2';
@@ -37,11 +38,14 @@ const REMOTE_CTL_PATH = fs.existsSync(path.join(ROOT_DIR, 'remote/remote-ctl.py'
   ? path.join(ROOT_DIR, 'remote/remote-ctl.py')
   : path.join(ROOT_DIR, 'remote-ctl.py');
 const CACHE_DIR = path.join(ROOT_DIR, 'cache');
+const RUNTIME_TOKENS_PATH = path.join(CACHE_DIR, 'runtime-tokens.json');
 const LOCAL_WWW_CACHE_DIR = path.join(CACHE_DIR, 'www');
 const LOCAL_WWW_META_PATH = path.join(CACHE_DIR, 'www-meta.json');
 const LOCAL_DELETED_TOMBSTONES_PATH = path.join(CACHE_DIR, 'deleted-conversations.json');
 const LOCAL_WWW_PATCH_VERSION = '20261103-ssh-v10';
-const EXPECTED_BRIDGE_VERSION = '20261114-ssh-v16';
+const EXPECTED_BRIDGE_VERSION = '20261118-ssh-v17';
+const GATEWAY_TOKEN = crypto.randomBytes(32).toString('hex');
+const LOCAL_DAEMON_DISCOVERY_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'daemon');
 const LOCAL_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
 const LOCAL_CLI_CONVERSATIONS_DIR = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'conversations');
 const LOCAL_BRAIN_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
@@ -161,6 +165,18 @@ const SSH_MUX_ARGS = [
   '-o', `ControlPath=${SSH_CONTROL_DIR}/%C`,
 ];
 
+function loadPersistedBridgeToken() {
+  try {
+    if (fs.existsSync(RUNTIME_TOKENS_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(RUNTIME_TOKENS_PATH, 'utf8'));
+      if (typeof parsed?.bridgeToken === 'string' && parsed.bridgeToken.trim()) {
+        return parsed.bridgeToken.trim();
+      }
+    }
+  } catch {}
+  return '';
+}
+
 export const sshState = {
   mode: 'auto',
   envFilter: 'all', // 'all' | 'local' | 'remote'
@@ -179,6 +195,7 @@ export const sshState = {
   remoteArch: 'x86_64',
   remoteHomeDir: '/home/user',
   csrfToken: '',
+  bridgeToken: loadPersistedBridgeToken(),
   localMacPort: 0,
   localMacCsrfToken: '',
   hasAuth: false,
@@ -191,6 +208,68 @@ export const sshState = {
   cloudProjectIds: [],
   updatedAt: 0,
 };
+
+function writeRuntimeTokensFile() {
+  try {
+    fs.mkdirSync(CACHE_DIR, {recursive: true});
+    const tmpPath = path.join(CACHE_DIR, `.runtime-tokens.${process.pid}.${Date.now()}.tmp`);
+    const payload = JSON.stringify(
+      {
+        gatewayToken: GATEWAY_TOKEN,
+        bridgeToken: sshState.bridgeToken || '',
+        updatedAt: Date.now(),
+      },
+      null,
+      2
+    );
+    const fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC, 0o600);
+    try {
+      fs.writeFileSync(fd, payload, 'utf8');
+      try {
+        fs.fchmodSync(fd, 0o600);
+      } catch {}
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, RUNTIME_TOKENS_PATH);
+  } catch {}
+}
+
+function constantTimeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function hasValidGatewayToken(reqHeaders) {
+  const gwTok = typeof reqHeaders?.['x-ag-gateway-token'] === 'string' ? reqHeaders['x-ag-gateway-token'].trim() : '';
+  return constantTimeEqual(gwTok, GATEWAY_TOKEN);
+}
+
+function isAuthorizedGatewayRequest(reqHeaders) {
+  if (hasValidGatewayToken(reqHeaders)) return true;
+  const csrf = typeof reqHeaders?.['x-codeium-csrf-token'] === 'string' ? reqHeaders['x-codeium-csrf-token'].trim() : '';
+  if (!csrf) return false;
+  if (sshState.localMacCsrfToken && constantTimeEqual(csrf, sshState.localMacCsrfToken)) return true;
+  if (sshState.csrfToken && constantTimeEqual(csrf, sshState.csrfToken)) return true;
+  return false;
+}
+
+let disconnectedBackoffUntil = 0;
+let disconnectedAttempts = 0;
+
+function resetDisconnectedBackoff() {
+  disconnectedBackoffUntil = 0;
+  disconnectedAttempts = 0;
+}
+
+function computeDisconnectedBackoffMs(attempts, rand = Math.random()) {
+  const safeAttempts = Math.max(1, Number(attempts) || 1);
+  const exp = Math.min(60000, 2000 * Math.pow(2, Math.min(5, safeAttempts - 1)));
+  return Math.round(exp * (0.85 + rand * 0.3));
+}
 
 let mainTunnelProc = null;
 let mainTunnelHost = null;
@@ -320,8 +399,10 @@ export function getSshState() {
     const pid = norm?.trajectoryMetadata?.projectId;
     if (pid) cascadeProjectMap[cid] = pid;
   }
+  const {bridgeToken: _omitBridgeToken, ...publicSshState} = sshState;
   return {
-    ...sshState,
+    ...publicSshState,
+    gatewayToken: GATEWAY_TOKEN,
     routeHosts: {...routeHosts()},
     routeLatencies: {...sshState.routeLatencies},
     sidecarPorts: [...sidecarTunnels.keys()],
@@ -336,6 +417,7 @@ export function getSshState() {
 }
 
 export async function setEnvFilter(filter) {
+  resetDisconnectedBackoff();
   const valid = ['all', 'local', 'remote'].includes(filter) ? filter : 'all';
   emitState({envFilter: valid});
   await pushMergedProjectListToBrowsers();
@@ -643,22 +725,32 @@ function resetLocalUpstreamH2() {
 }
 
 function addCorsHeaders(headers = {}, reqHeaders = {}) {
-  const origin = reqHeaders.origin || '*';
+  const rawOrigin = typeof reqHeaders?.origin === 'string' ? reqHeaders.origin.trim() : '';
+  const allowedOrigin =
+    rawOrigin && (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(rawOrigin) || /^plugin:\/\//i.test(rawOrigin))
+      ? rawOrigin
+      : '';
   const clean = {};
   for (const [k, v] of Object.entries(headers)) {
-    if (!k.startsWith(':')) clean[k] = v;
+    const lk = k.toLowerCase();
+    if (!k.startsWith(':') && lk !== 'access-control-allow-origin' && lk !== 'access-control-allow-credentials') {
+      clean[k] = v;
+    }
   }
-  return {
+  const out = {
     ...clean,
-    'access-control-allow-origin': origin,
-    'access-control-allow-credentials': 'true',
     'access-control-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
     'access-control-allow-headers':
-      reqHeaders['access-control-request-headers'] ||
-      'content-type, connect-protocol-version, connect-timeout-ms, x-grpc-web, x-codeium-csrf-token, x-user-agent, x-ag-client, x-ag-target-env, x-ag-active-project, x-ag-force-target, x-ag-local-port, x-ag-local-csrf',
+      reqHeaders?.['access-control-request-headers'] ||
+      'content-type, connect-protocol-version, connect-timeout-ms, x-grpc-web, x-codeium-csrf-token, x-user-agent, x-ag-client, x-ag-target-env, x-ag-active-project, x-ag-force-target, x-ag-local-port, x-ag-local-csrf, x-ag-gateway-token',
     'access-control-expose-headers':
       'grpc-status, grpc-message, grpc-status-details-bin, content-type, connect-content-encoding',
   };
+  if (allowedOrigin) {
+    out['access-control-allow-origin'] = allowedOrigin;
+    out['access-control-allow-credentials'] = 'true';
+  }
+  return out;
 }
 
 function writeSafeHead(res, status, headers = {}, reqHeaders = {}) {
@@ -710,6 +802,14 @@ function encodeGrpcWebTrailerFrame(status = 0, message = '') {
   const payload = Buffer.from(lines.join(''), 'utf8');
   const hdr = Buffer.alloc(5);
   hdr[0] = 0x80;
+  hdr.writeUInt32BE(payload.length, 1);
+  return Buffer.concat([hdr, payload]);
+}
+
+function encodeConnectEndStreamFrame(obj = {}) {
+  const payload = Buffer.from(JSON.stringify(obj), 'utf8');
+  const hdr = Buffer.alloc(5);
+  hdr[0] = 0x02;
   hdr.writeUInt32BE(payload.length, 1);
   return Buffer.concat([hdr, payload]);
 }
@@ -2492,6 +2592,9 @@ function bridgeRequest({port, method = 'GET', path: urlPath, body = null, deadli
       resolve(val);
     };
     const headers = body ? {'content-type': 'application/json', 'content-length': String(body.length)} : {};
+    if (sshState.bridgeToken) {
+      headers['x-ag-bridge-token'] = sshState.bridgeToken;
+    }
     const req = http.request(
       {
         method,
@@ -2845,11 +2948,14 @@ async function handleFederatedProjectUpdatesStream(req, res, parsedJson) {
   const outCt = ct.includes('connect') ? 'application/connect+json' : 'application/grpc-web+json';
   writeSafeHead(res, 200, {'content-type': outCt}, req.headers);
 
-  // If client is subscribing to Enterprise (backend=3), return empty project list
+  // If client is subscribing to Enterprise (backend=3), return empty project list and end cleanly
   const backend = parsedJson?.backend;
   if (isEnterpriseBackend(backend)) {
     if (!res.writableEnded && !res.destroyed) {
-      res.write(encodeDataFrame({projectList: {projectIds: []}}));
+      const endFrame = ct.includes('connect') ? encodeConnectEndStreamFrame({}) : encodeGrpcWebTrailerFrame(0);
+      try {
+        res.end(Buffer.concat([encodeDataFrame({projectList: {projectIds: []}}), endFrame]));
+      } catch {}
     }
     return;
   }
@@ -3126,11 +3232,14 @@ async function handleFederatedSummariesStream(req, res, reqBody, parsedJson) {
   const outCt = ct.includes('connect') ? 'application/connect+json' : 'application/grpc-web+json';
   writeSafeHead(res, 200, {'content-type': outCt}, req.headers);
 
-  // If client is subscribing to Enterprise (backend=3), return empty updates
+  // If client is subscribing to Enterprise (backend=3), return empty updates and end cleanly
   const backend = parsedJson?.backend;
   if (isEnterpriseBackend(backend)) {
     if (!res.writableEnded && !res.destroyed) {
-      res.write(encodeDataFrame({updates: {}}));
+      const endFrame = ct.includes('connect') ? encodeConnectEndStreamFrame({}) : encodeGrpcWebTrailerFrame(0);
+      try {
+        res.end(Buffer.concat([encodeDataFrame({updates: {}}), endFrame]));
+      } catch {}
     }
     return;
   }
@@ -3279,8 +3388,8 @@ function extractFirstUriFromObject(obj) {
   return '';
 }
 
-function decideRpcTarget(methodName, reqHeaders, parsedJson, rawText) {
-  const forced = reqHeaders['x-ag-force-target'];
+function decideRpcTarget(methodName = '', reqHeaders = {}, parsedJson = null, _rawText = '') {
+  const forced = reqHeaders?.['x-ag-force-target'];
   if (forced === 'remote') return 'remote';
   if (forced === 'local') return 'local';
 
@@ -3332,7 +3441,7 @@ function decideRpcTarget(methodName, reqHeaders, parsedJson, rawText) {
     parsedJson?.projectEnvConfig?.projectId ||
     parsedJson?.project?.id ||
     parsedJson?.metadata?.projectId ||
-    (methodName.includes('Project') ? parsedJson?.id : '') ||
+    (String(methodName).includes('Project') ? parsedJson?.id : '') ||
     '';
   if (pid) {
     if ((String(pid).includes('/jetski_remote_agents_3p/') || cloudProjectIdsSet.has(pid)) && sshState.status === 'connected') {
@@ -3344,11 +3453,11 @@ function decideRpcTarget(methodName, reqHeaders, parsedJson, rawText) {
 
   // 3. Check terminalId
   const tid = parsedJson?.terminalId || parsedJson?.id || '';
-  if (tid && methodName.includes('Terminal') && remoteTerminalIds.has(tid)) {
+  if (tid && String(methodName).includes('Terminal') && remoteTerminalIds.has(tid)) {
     return 'remote';
   }
 
-  // 4. Check file/folder URI in payload or rawText
+  // 4. Check file/folder URI in structured payload ONLY (never rawText / prompt text)
   const uri = extractFirstUriFromObject(parsedJson) || '';
   if (uri) {
     const cleanUri = uri.replace(/\/+$/, '');
@@ -3364,40 +3473,48 @@ function decideRpcTarget(methodName, reqHeaders, parsedJson, rawText) {
         return 'local';
       }
     }
-  }
-  const checkStr = uri || rawText || '';
-  if (
-    checkStr.includes('file:///Users/') ||
-    checkStr.includes('file:///Applications/') ||
-    checkStr.includes('file:///Library/') ||
-    checkStr.includes('file:///Volumes/') ||
-    checkStr.startsWith('/Users/') ||
-    checkStr.startsWith('/Applications/') ||
-    checkStr.startsWith('/Volumes/')
-  ) {
-    return 'local';
-  }
-  if (
-    checkStr.includes('file:///home/') ||
-    checkStr.includes('file:///develop') ||
-    checkStr.includes('file:///data') ||
-    checkStr.includes('file:///root') ||
-    checkStr.includes('file:///opt/') ||
-    checkStr.includes('file:///srv/') ||
-    checkStr.includes('file:///mnt/') ||
-    checkStr.startsWith('/home/') ||
-    checkStr.startsWith('/develop') ||
-    checkStr.startsWith('/data') ||
-    checkStr.startsWith('/root') ||
-    checkStr.startsWith('/opt/') ||
-    checkStr.startsWith('/srv/') ||
-    checkStr.startsWith('/mnt/')
-  ) {
-    return 'remote';
+    if (
+      uri.startsWith('file:///opt/homebrew/') ||
+      uri === 'file:///opt/homebrew' ||
+      uri.startsWith('/opt/homebrew/') ||
+      uri === '/opt/homebrew'
+    ) {
+      return 'local';
+    }
+    if (
+      uri.startsWith('file:///Users/') ||
+      uri.startsWith('file:///Applications/') ||
+      uri.startsWith('file:///Library/') ||
+      uri.startsWith('file:///Volumes/') ||
+      uri.startsWith('/Users/') ||
+      uri.startsWith('/Applications/') ||
+      uri.startsWith('/Library/') ||
+      uri.startsWith('/Volumes/')
+    ) {
+      return 'local';
+    }
+    if (
+      uri.startsWith('file:///home/') ||
+      uri.startsWith('file:///develop') ||
+      uri.startsWith('file:///data') ||
+      uri.startsWith('file:///root') ||
+      uri.startsWith('file:///opt/') ||
+      uri.startsWith('file:///srv/') ||
+      uri.startsWith('file:///mnt/') ||
+      uri.startsWith('/home/') ||
+      uri.startsWith('/develop') ||
+      uri.startsWith('/data') ||
+      uri.startsWith('/root') ||
+      uri.startsWith('/opt/') ||
+      uri.startsWith('/srv/') ||
+      uri.startsWith('/mnt/')
+    ) {
+      return 'remote';
+    }
   }
 
   // 5. Check active project header and active UI context header
-  const activeProjHeader = reqHeaders['x-ag-active-project'];
+  const activeProjHeader = reqHeaders?.['x-ag-active-project'];
   if (activeProjHeader) {
     if (
       (activeProjHeader === REMOTE_DEFAULT_PROJECT_ALIAS || remoteProjectIdsSet.has(activeProjHeader)) &&
@@ -3410,7 +3527,7 @@ function decideRpcTarget(methodName, reqHeaders, parsedJson, rawText) {
     }
   }
 
-  const uiTarget = reqHeaders['x-ag-target-env'];
+  const uiTarget = reqHeaders?.['x-ag-target-env'];
   if (uiTarget === 'remote' && sshState.status === 'connected') {
     return 'remote';
   }
@@ -3487,6 +3604,7 @@ function ensureSwarmBoardProxy() {
 
 function ensureLocalHttpsProxy() {
   if (localProxyServer) return;
+  writeRuntimeTokensFile();
   try {
     const {cert, key} = extractCertAndKey();
     ensureLocalPatchedMainJs();
@@ -3494,14 +3612,23 @@ function ensureLocalHttpsProxy() {
     localProxyServer = http2.createSecureServer({cert, key, allowHTTP1: true}, (req, res) => {
       const reqPath = req.url || '/';
 
-      // Learn local Mac port & CSRF token from browser headers if provided
-      const headerLocalPort = Number(req.headers['x-ag-local-port'] || 0);
-      const headerLocalCsrf = String(req.headers['x-ag-local-csrf'] || '');
-      if (headerLocalPort > 0 && headerLocalPort !== 58282 && headerLocalPort !== sshState.localMacPort) {
-        sshState.localMacPort = headerLocalPort;
-      }
-      if (headerLocalCsrf && headerLocalCsrf !== sshState.localMacCsrfToken) {
-        sshState.localMacCsrfToken = headerLocalCsrf;
+      // Learn local Mac port & CSRF token only from authenticated gateway requests
+      if (hasValidGatewayToken(req.headers)) {
+        const headerLocalPort = Number(req.headers['x-ag-local-port'] || 0);
+        const headerLocalCsrf = typeof req.headers['x-ag-local-csrf'] === 'string' ? req.headers['x-ag-local-csrf'] : '';
+        if (
+          Number.isInteger(headerLocalPort) &&
+          headerLocalPort >= 1024 &&
+          headerLocalPort <= 65535 &&
+          headerLocalPort !== 58282 &&
+          headerLocalPort !== 58285 &&
+          headerLocalPort !== sshState.localMacPort
+        ) {
+          sshState.localMacPort = headerLocalPort;
+        }
+        if (headerLocalCsrf && headerLocalCsrf !== sshState.localMacCsrfToken) {
+          sshState.localMacCsrfToken = headerLocalCsrf;
+        }
       }
 
       // Handle CORS preflight
@@ -3511,7 +3638,12 @@ function ensureLocalHttpsProxy() {
         return;
       }
 
-      if (req.method === 'GET' && reqPath === '/__ag/relay-stats') {
+      if (req.method === 'GET' && (reqPath === '/__ag/relay-stats' || reqPath.startsWith('/__ag/relay-stats?'))) {
+        if (!isAuthorizedGatewayRequest(req.headers)) {
+          writeSafeHead(res, 401, {'content-type': 'text/plain'}, req.headers);
+          res.end('Unauthorized');
+          return;
+        }
         const body = Buffer.from(JSON.stringify({enabled: RELAY_ENABLED, remoteProtocol: remoteRelayProtocol, methods: [...RELAY_STREAM_METHODS], streams: getRelayStats()}), 'utf8');
         writeSafeHead(res, 200, {'content-type': 'application/json', 'content-length': String(body.length)}, req.headers);
         res.end(body);
@@ -3547,7 +3679,7 @@ function ensureLocalHttpsProxy() {
               const appConfig = JSON.stringify({
                 productName: 'antigravity',
                 csrfToken: sshState.csrfToken || '',
-                appVersion: '1.23.6',
+                appVersion: detectLocalAppVersion(),
                 releaseChannel: 'stable',
                 devMode: false,
               });
@@ -3571,6 +3703,14 @@ function ensureLocalHttpsProxy() {
               return;
             } catch {}
           }
+        }
+      }
+
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        if (!isAuthorizedGatewayRequest(req.headers)) {
+          writeSafeHead(res, 401, {'content-type': 'text/plain'}, req.headers);
+          res.end('Unauthorized');
+          return;
         }
       }
 
@@ -4014,7 +4154,7 @@ function startRelayedStream(req, res, reqPath, outHeaders, forwardBody, parsedJs
     label: `${reqPath.split('/').pop()}${cid ? ` ${cid.slice(0, 8)}` : ''}`,
     getBridge: () =>
       sshState.status === 'connected' && sshState.localBridgePort
-        ? {host: '127.0.0.1', port: sshState.localBridgePort}
+        ? {host: '127.0.0.1', port: sshState.localBridgePort, token: sshState.bridgeToken || ''}
         : null,
     onReconnected: (fn) => {
       relayReconnectWaiters.add(fn);
@@ -4353,10 +4493,11 @@ async function runRemoteCtl(host, action = 'ensure') {
 
     let stdout = '';
     let stderr = '';
+    const timeoutMs = safeAction === 'status' ? 15000 : 180000;
     const timer = setTimeout(() => {
       try { proc.kill('SIGKILL'); } catch {}
       reject(new Error(`remote-ctl ${action} timed out on ${host}`));
-    }, 22000);
+    }, timeoutMs);
 
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
@@ -4367,6 +4508,10 @@ async function runRemoteCtl(host, action = 'ensure') {
       try {
         const parsed = JSON.parse(lastLine);
         if (parsed.ok) {
+          if (typeof parsed.bridgeToken === 'string' && parsed.bridgeToken) {
+            sshState.bridgeToken = parsed.bridgeToken;
+            writeRuntimeTokensFile();
+          }
           resolve(parsed);
         } else {
           reject(new Error(parsed.error || `remote-ctl failed (${code}): ${stderr}`));
@@ -4419,6 +4564,63 @@ function checkHttpsLocal(port, timeoutMs = 2000) {
 
 let lastLocalLsPortVerifiedTs = 0;
 
+async function discoverLocalLsFromDaemonFiles() {
+  try {
+    if (!fs.existsSync(LOCAL_DAEMON_DISCOVERY_DIR)) return 0;
+    const entries = fs.readdirSync(LOCAL_DAEMON_DISCOVERY_DIR);
+    const lsFiles = [];
+    const hubFiles = [];
+    for (const name of entries) {
+      if (!name.endsWith('.json')) continue;
+      const isLs = name.startsWith('ls_');
+      const isHub = name.startsWith('hub_');
+      if (!isLs && !isHub) continue;
+      const fullPath = path.join(LOCAL_DAEMON_DISCOVERY_DIR, name);
+      try {
+        const st = fs.statSync(fullPath);
+        if (st.isFile()) {
+          (isLs ? lsFiles : hubFiles).push({path: fullPath, mtimeMs: st.mtimeMs});
+        }
+      } catch {}
+    }
+    lsFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    hubFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const file of [...lsFiles, ...hubFiles]) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(file.path, 'utf8'));
+        const pid = Number(raw?.pid || 0);
+        const port = Number(raw?.httpsPort || 0);
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        try {
+          process.kill(pid, 0);
+        } catch {
+          continue;
+        }
+        if (
+          !Number.isInteger(port) ||
+          port < 1024 ||
+          port > 65535 ||
+          port === 58282 ||
+          port === 58285 ||
+          port === 58283 ||
+          port === 58284
+        ) {
+          continue;
+        }
+        const chk = await checkHttpsLocal(port, 800);
+        if (chk.ok) {
+          sshState.localMacPort = port;
+          const csrf = chk.csrfToken || (typeof raw?.csrfToken === 'string' ? raw.csrfToken : '');
+          if (csrf) sshState.localMacCsrfToken = csrf;
+          lastLocalLsPortVerifiedTs = Date.now();
+          return port;
+        }
+      } catch {}
+    }
+  } catch {}
+  return 0;
+}
+
 export async function discoverLocalMacLsPort() {
   if (sshState.localMacPort && sshState.localMacPort !== 58282 && sshState.localMacPort !== 58285) {
     if (sshState.localMacCsrfToken && Date.now() - lastLocalLsPortVerifiedTs < 15000) {
@@ -4433,11 +4635,31 @@ export async function discoverLocalMacLsPort() {
       return sshState.localMacPort;
     }
   }
+  const fromDaemonFile = await discoverLocalLsFromDaemonFiles();
+  if (fromDaemonFile) return fromDaemonFile;
   return new Promise((resolve) => {
-    const proc = spawn('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN']);
+    let settled = false;
+    let killTimer = null;
+    const done = (val) => {
+      if (settled) return;
+      settled = true;
+      if (killTimer) clearTimeout(killTimer);
+      resolve(val);
+    };
+    const proc = spawn('lsof', ['-nP', '-a', '-c', 'language_', '-iTCP', '-sTCP:LISTEN'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
     let out = '';
+    killTimer = setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {}
+      done(sshState.localMacPort || 0);
+    }, 4000);
     proc.stdout.on('data', (d) => { out += d.toString(); });
     proc.on('close', async () => {
+      if (killTimer) clearTimeout(killTimer);
+      if (settled) return;
       const ports = new Set();
       for (const line of out.split('\n')) {
         if (!line.includes('language_')) continue;
@@ -4453,13 +4675,13 @@ export async function discoverLocalMacLsPort() {
           sshState.localMacPort = p;
           if (chk.csrfToken) sshState.localMacCsrfToken = chk.csrfToken;
           lastLocalLsPortVerifiedTs = Date.now();
-          resolve(p);
+          done(p);
           return;
         }
       }
-      resolve(sshState.localMacPort || 0);
+      done(sshState.localMacPort || 0);
     });
-    proc.on('error', () => resolve(sshState.localMacPort || 0));
+    proc.on('error', () => done(sshState.localMacPort || 0));
   });
 }
 
@@ -4467,10 +4689,27 @@ export async function discoverLocalMacLsPort() {
 export const __test = {
   bridgeRequest: (...a) => bridgeRequest(...a),
   pingBridge: (...a) => pingBridge(...a),
+  fetchBridgeStatus: (...a) => fetchBridgeStatus(...a),
+  decideRpcTarget: (...a) => decideRpcTarget(...a),
+  addCorsHeaders: (...a) => addCorsHeaders(...a),
+  computeDisconnectedBackoffMs: (...a) => computeDisconnectedBackoffMs(...a),
+  hasValidGatewayToken: (...a) => hasValidGatewayToken(...a),
+  isAuthorizedGatewayRequest: (...a) => isAuthorizedGatewayRequest(...a),
+  getGatewayToken: () => GATEWAY_TOKEN,
+  getRuntimeTokensPath: () => RUNTIME_TOKENS_PATH,
+  writeRuntimeTokensFile: () => writeRuntimeTokensFile(),
+  getDisconnectedBackoffState: () => ({disconnectedBackoffUntil, disconnectedAttempts}),
+  resetDisconnectedBackoff: () => resetDisconnectedBackoff(),
 };
 
 async function fetchBridgeStatus(bridgePort, timeoutMs = 2500) {
-  return parseBridgeJson(await bridgeRequest({port: bridgePort, path: '/status', deadlineMs: timeoutMs, control: true}));
+  const res = await bridgeRequest({port: bridgePort, path: '/status', deadlineMs: timeoutMs, control: true});
+  if (!res) return null;
+  const parsed = parseBridgeJson(res);
+  if (res.status === 401) {
+    return {...(parsed || {}), ok: false, unauthorized: true, httpStatus: 401};
+  }
+  return parsed;
 }
 
 async function pingBridge(bridgePort, timeoutMs = 2500) {
@@ -4479,6 +4718,7 @@ async function pingBridge(bridgePort, timeoutMs = 2500) {
 }
 
 export async function stopRemoteTunnel(nextMode = 'local') {
+  resetDisconnectedBackoff();
   connectGeneration += 1;
   connectingPromise = null;
   connectingMode = '';
@@ -4556,7 +4796,10 @@ async function killStaleSshForwards() {
 }
 
 export async function ensureRemoteTunnel(requestedMode = sshState.mode, options = {}) {
-  const {forceRestart = false, forceReconnect = false} = options;
+  const {forceRestart = false, forceReconnect = false, fromHealthPoll = false} = options;
+  if (forceRestart || !fromHealthPoll) {
+    resetDisconnectedBackoff();
+  }
   const targetMode = normalizeSshMode(requestedMode || 'auto');
   sshState.mode = targetMode;
 
@@ -4582,6 +4825,7 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
   ) {
     const ping = await pingBridge(sshState.localBridgePort, 2000);
     if (ping.ok) {
+      resetDisconnectedBackoff();
       if (mainTunnelHost) sshState.routeLatencies[mainTunnelHost] = ping.latencyMs;
       return emitState({latencyMs: ping.latencyMs, status: 'connected'});
     }
@@ -4665,8 +4909,14 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
               (stderrText.includes('Connection refused') ||
                 stderrText.includes('connect failed') ||
                 stderrText.includes('open failed') ||
+                st?.httpStatus === 401 ||
+                st?.unauthorized ||
                 (st && st.running === false))
             ) {
+              if (st?.httpStatus === 401 || st?.unauthorized) {
+                try { proc.kill('SIGTERM'); } catch {}
+                return {ok: false, unauthorized: true, error: `Bridge /status returned 401 on ${host}`};
+              }
               break;
             }
             await new Promise((r) => setTimeout(r, 140));
@@ -4734,6 +4984,7 @@ export async function ensureRemoteTunnel(requestedMode = sshState.mode, options 
       if (isStale()) return getSshState();
       const {host, remoteInfo, pingRtt, rHttps, rHttp, rBridge, tHttps, lHttp, lBridge} = established;
       consecutivePingFailures = 0;
+      resetDisconnectedBackoff();
       if (host !== sshState.activeHost) lastRouteSwitchTs = Date.now();
       rttEwmaMs = 0;
       noteRtt(pingRtt);
@@ -4833,9 +5084,9 @@ function adaptiveTimeout(baseMs, maxMs = 15000) {
   return Math.min(maxMs, Math.max(baseMs, rttEwmaMs * 8));
 }
 
-function reconnectTunnel(reason) {
+function reconnectTunnel(reason, opts = {}) {
   logSsh(`Reconnecting SSH tunnel (mode=${sshState.mode}, host=${mainTunnelHost || sshState.activeHost || '-'}): ${reason}`);
-  return ensureRemoteTunnel(sshState.mode, {forceReconnect: true});
+  return ensureRemoteTunnel(sshState.mode, {forceReconnect: true, fromHealthPoll: Boolean(opts.fromHealthPoll)});
 }
 
 export async function pollTunnelHealth() {
@@ -4874,18 +5125,25 @@ async function pollTunnelHealthOnce() {
       .catch(() => {})
       .finally(() => { localDiscoveryInFlight = false; });
   }
-  syncCliSummariesAndPushUpdates().catch(() => {});
+  if (!cliSummariesIntervalTimer) {
+    syncCliSummariesAndPushUpdates().catch(() => {});
+  }
   if (sshState.mode === 'local') return getSshState();
   if (connectingPromise) return getSshState();
 
   if (!mainTunnelProc || mainTunnelProc.exitCode !== null || sshState.status !== 'connected') {
+    if (Date.now() < disconnectedBackoffUntil) {
+      return getSshState();
+    }
+    disconnectedAttempts += 1;
+    disconnectedBackoffUntil = Date.now() + computeDisconnectedBackoffMs(disconnectedAttempts);
     consecutivePingFailures += 1;
     const why = !mainTunnelProc
       ? 'no tunnel process'
       : mainTunnelProc.exitCode !== null
         ? `ssh exited (${mainTunnelProc.exitCode})`
         : `status=${sshState.status}`;
-    return reconnectTunnel(why);
+    return reconnectTunnel(why, {fromHealthPoll: true});
   }
 
   const ping = await pingBridge(sshState.localBridgePort, adaptiveTimeout(4000));
@@ -4899,14 +5157,18 @@ async function pollTunnelHealthOnce() {
     const desiredAppVersion = detectLocalAppVersion();
     if (
       st &&
-      (st.running === false ||
+      (st.httpStatus === 401 ||
+        st.unauthorized ||
+        st.running === false ||
         (st.version && st.version !== desiredAppVersion) ||
         (st.bridgeVersion && st.bridgeVersion !== EXPECTED_BRIDGE_VERSION))
     ) {
       return reconnectTunnel(
-        st.running === false
-          ? 'remote language_server not running'
-          : `remote version mismatch (ls=${st.version}, bridge=${st.bridgeVersion})`
+        st.httpStatus === 401 || st.unauthorized
+          ? 'bridge auth unauthorized (401)'
+          : st.running === false
+            ? 'remote language_server not running'
+            : `remote version mismatch (ls=${st.version}, bridge=${st.bridgeVersion})`
       );
     }
 

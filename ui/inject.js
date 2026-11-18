@@ -1,6 +1,9 @@
 (function install(config, css, dictionary, signature) {
-  if (!['127.0.0.1', 'localhost'].includes(location.hostname)) return;
-  const PATCH_VERSION = '20261110-ssh-v13';
+  if (!['127.0.0.1', 'localhost', '::1', '[::1]'].includes(location.hostname)) return;
+  if (/\(SSH:\s/i.test((typeof document !== 'undefined' ? document.title : '') || '') || Boolean(window.sshRemote?.currentHost)) {
+    return;
+  }
+  const PATCH_VERSION = '20261118-ssh-v14';
 
   if (typeof window.__ag_multiplexer_booted_before_main === 'undefined') {
     window.__ag_multiplexer_booted_before_main = document.readyState === 'loading';
@@ -41,6 +44,9 @@
       let isStreamingRpc = false;
       let muxUrl = '';
       let nextInit = null;
+      let retryInit = null;
+      let fallbackInput = input;
+      const isReq = typeof Request !== 'undefined' && input instanceof Request;
       try {
         const urlStr = typeof input === 'string' ? input : (input?.url || String(input));
         const rpcMarker = '/exa.language_server_pb.LanguageServerService/';
@@ -67,12 +73,16 @@
             rpcPath.includes('JetboxSubscribeToSummaries');
           muxUrl = `https://127.0.0.1:58282${rpcPath}`;
           const headers = new Headers(
-            init?.headers || (typeof Request !== 'undefined' && input instanceof Request ? input.headers : undefined)
+            init?.headers || (isReq ? input.headers : undefined)
           );
           headers.set('x-ag-client', 'unified-browser');
           headers.set('x-ag-target-env', window.__ag_active_env || 'local');
           if (window.__ag_active_project_id) {
             headers.set('x-ag-active-project', String(window.__ag_active_project_id));
+          }
+          const gwTok = window.__ag_ssh_state?.gatewayToken || '';
+          if (gwTok) {
+            headers.set('x-ag-gateway-token', gwTok);
           }
 
           const localPort =
@@ -91,32 +101,57 @@
             ...(init || {}),
             headers,
           };
-          if (typeof Request !== 'undefined' && input instanceof Request && !init?.body && input.body) {
+          retryInit = {
+            ...(init || {}),
+            headers: new Headers(headers),
+          };
+          let retryReq = null;
+          if (isReq && !input.bodyUsed) {
+            fallbackInput = input.clone();
             nextInit.method = nextInit.method || input.method;
-            nextInit.body = input.body;
-            nextInit.duplex = 'half';
+            retryInit.method = retryInit.method || input.method;
+            if (!init?.body && input.body) {
+              retryReq = input.clone();
+              nextInit.body = input.body;
+              nextInit.duplex = 'half';
+              retryInit.body = retryReq.body;
+              retryInit.duplex = 'half';
+            }
           }
-          return await origFetch(muxUrl, nextInit);
+          const primaryRes = await origFetch(muxUrl, nextInit);
+          if (retryReq?.body && !retryReq.bodyUsed && typeof retryReq.body.cancel === 'function') {
+            retryReq.body.cancel().catch(() => {});
+          }
+          if (isReq && fallbackInput !== input && fallbackInput.body && !fallbackInput.bodyUsed && typeof fallbackInput.body.cancel === 'function') {
+            fallbackInput.body.cancel().catch(() => {});
+          }
+          return primaryRes;
         }
       } catch (err) {
-        if (muxUrl && nextInit) {
+        if (muxUrl && (retryInit || nextInit)) {
           try {
             await new Promise(r => setTimeout(r, 350));
-            return await origFetch(muxUrl, nextInit);
+            const retryRes = await origFetch(muxUrl, retryInit || nextInit);
+            if (isReq && fallbackInput !== input && fallbackInput.body && !fallbackInput.bodyUsed && typeof fallbackInput.body.cancel === 'function') {
+              fallbackInput.body.cancel().catch(() => {});
+            }
+            return retryRes;
           } catch {}
         }
         if (location.port !== '58282') {
           if (isStreamingRpc && typeof AbortController !== 'undefined') {
             const fbCtrl = new AbortController();
             window.__ag_fallback_stream_controllers.add(fbCtrl);
-            const origSig = init?.signal || (typeof Request !== 'undefined' && input instanceof Request ? input.signal : null);
+            const origSig = init?.signal || (isReq ? input.signal : null);
             const combinedSignal =
               origSig && typeof AbortSignal?.any === 'function'
                 ? AbortSignal.any([origSig, fbCtrl.signal])
                 : fbCtrl.signal;
-            return origFetch(input, {...(init || {}), signal: combinedSignal});
+            return Promise.resolve()
+              .then(() => origFetch(fallbackInput, {...(init || {}), signal: combinedSignal}))
+              .finally(() => window.__ag_fallback_stream_controllers?.delete(fbCtrl));
           }
-          return origFetch(input, init);
+          return origFetch(fallbackInput, init);
         }
         throw err;
       }
@@ -173,6 +208,7 @@
     remoteHostname: 'remote-host',
     remoteHomeDir: '/home/user',
     csrfToken: '',
+    gatewayToken: '',
     hasAuth: true,
     sidecarPorts: [],
     projectEnvMap: {},
@@ -526,6 +562,7 @@
   async function resolveRemoteFolderForHeal(uri) {
     try {
       const fetchFn = window.__ag_orig_fetch || window.fetch;
+      const gwTok = window.__ag_ssh_state?.gatewayToken || '';
       const res = await fetchFn('https://127.0.0.1:58282/exa.language_server_pb.LanguageServerService/ResolveFolder', {
         method: 'POST',
         headers: {
@@ -533,6 +570,7 @@
           'connect-protocol-version': '1',
           'x-ag-force-target': 'remote',
           'x-ag-client': 'unified-browser-heal',
+          ...(gwTok ? {'x-ag-gateway-token': gwTok} : {}),
         },
         body: JSON.stringify({folderUri: uri}),
       });
@@ -716,8 +754,16 @@
   const RE_WORKED_FOR = /^Worked for\s+([<0-9smhd]+(?:\s+\d+[smhd])*)$/i;
   const RE_THOUGHT_FOR = /^Thought for\s+([<0-9smhd]+(?:\s+\d+[smhd])*)$/i;
   const RE_RUNNING_FOR = /^Running\s+for\s+([<0-9smhd]+(?:\s+\d+[smhd])*)$/i;
-  const RE_EPHEMERAL_SUMMARY =
-    /^(Explored(?:\s+(?:\d+\s+)?(?:files?|artifacts?)(?:\s+and\s+(?:\d+\s+)?(?:files?|artifacts?))?)?|Ran\s+(?:\d+\s+)?commands?|Edited(?:\s+(?:\d+\s+)?(?:files?|artifacts?)(?:\s+and\s+(?:\d+\s+)?(?:files?|artifacts?))?)?)(?:,\s*(explored(?:\s+(?:\d+\s+)?(?:files?|artifacts?)(?:\s+and\s+(?:\d+\s+)?(?:files?|artifacts?))?)?|ran\s+(?:\d+\s+)?commands?|edited(?:\s+(?:\d+\s+)?(?:files?|artifacts?)(?:\s+and\s+(?:\d+\s+)?(?:files?|artifacts?))?)?))*$/i;
+  const RE_EPHEMERAL_CLAUSE =
+    /^(?:explored|edited)(?:\s+(?:\d+\s+)?(?:files?|artifacts?)(?:\s+and\s+(?:\d+\s+)?(?:files?|artifacts?))?)?$|^ran\s+(?:\d+\s+)?commands?$/i;
+  function isEphemeralSummary(trimmed) {
+    if (!trimmed || typeof trimmed !== 'string' || trimmed.length > 240) return false;
+    const parts = trimmed.split(/,\s*/);
+    for (let i = 0; i < parts.length; i++) {
+      if (!RE_EPHEMERAL_CLAUSE.test(parts[i])) return false;
+    }
+    return true;
+  }
   const EPHEMERAL_CLAUSE_MAP = {
     explored: '已探索',
     'explored file': '已探索文件',
@@ -842,7 +888,7 @@
         return raw.replace(RE_DELETE_RECORDINGS_CONFIRM, '这将从您的设备中删除 $1 条通话录音（$2），此操作无法撤销。');
       }
     } else if (firstUpper === 'E' || firstUpper === 'R' || firstUpper === 'L') {
-      if (RE_EPHEMERAL_SUMMARY.test(trimmed)) {
+      if (isEphemeralSummary(trimmed)) {
         const translatedSummary = trimmed
           .split(/,\s*/)
           .map(part => translateEphemeralClause(part))
@@ -1049,12 +1095,14 @@
   // --- §5.6 交互式远程 SSH 目录浏览器弹窗 (支持在任意窗口直接浏览远程服务器目录并添加为侧边栏项目) ---
   async function callRemoteRpcJson(methodName, payloadObj = {}) {
     const fn = window.__ag_orig_fetch || window.fetch;
+    const gwTok = window.__ag_ssh_state?.gatewayToken || '';
     const res = await fn(`https://127.0.0.1:58282/exa.language_server_pb.LanguageServerService/${methodName}`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'connect-protocol-version': '1',
         'x-ag-force-target': 'remote',
+        ...(gwTok ? {'x-ag-gateway-token': gwTok} : {}),
       },
       body: JSON.stringify(payloadObj),
     });
@@ -1073,50 +1121,25 @@
     let showHidden = false;
     const hostName = sshState.remoteHostname || 'remote-host';
 
-    modal = document.createElement('div');
-    modal.id = 'ag-remote-folder-modal';
-    modal.className = 'ag-remote-modal-backdrop';
-    modal.innerHTML = [
-      '<div class="ag-remote-modal-dialog" role="dialog" aria-label="打开远程 SSH 目录">',
-      '  <div class="ag-remote-modal-hdr">',
-      '    <div class="ag-remote-modal-title-row">',
-      `      <span class="ag-remote-modal-badge">SSH · ${hostName}</span>`,
-      '      <span class="ag-remote-modal-title">选择远程服务器目录添加到侧边栏</span>',
-      '    </div>',
-      '    <button type="button" class="ag-remote-modal-close" id="ag-remote-modal-close" title="关闭">✕</button>',
-      '  </div>',
-      '  <div class="ag-remote-modal-Quick">',
-      '    <span class="ag-remote-quick-lbl">常用路径:</span>',
-      `    <button type="button" class="ag-remote-quick-chip" data-path="${homeDir}">${homeDir}</button>`,
-      '    <button type="button" class="ag-remote-quick-chip" data-path="/develop">/develop</button>',
-      '    <button type="button" class="ag-remote-quick-chip" data-path="/data">/data</button>',
-      '    <button type="button" class="ag-remote-quick-chip" data-path="/tmp">/tmp</button>',
-      '    <button type="button" class="ag-remote-quick-chip" data-path="/">/</button>',
-      '  </div>',
-      '  <div class="ag-remote-modal-pathbar">',
-      '    <button type="button" class="ag-ssh-btn ag-ssh-btn-secondary" id="ag-remote-up-btn" title="返回上级目录">⬆️ 上级</button>',
-      '    <input type="text" id="ag-remote-path-input" class="ag-remote-path-input" spellcheck="false" />',
-      '    <button type="button" class="ag-ssh-btn ag-ssh-btn-secondary" id="ag-remote-go-btn">跳转</button>',
-      '    <label class="ag-remote-hidden-lbl"><input type="checkbox" id="ag-remote-hidden-chk" />显示隐藏项</label>',
-      '  </div>',
-      '  <div class="ag-remote-modal-list" id="ag-remote-dir-list"></div>',
-      '  <div class="ag-remote-modal-ftr">',
-      '    <span class="ag-remote-modal-status" id="ag-remote-modal-status"></span>',
-      '    <div class="ag-remote-modal-ftr-btns">',
-      '      <button type="button" class="ag-ssh-btn ag-ssh-btn-secondary" id="ag-remote-cancel-btn">取消</button>',
-      '      <button type="button" class="ag-ssh-btn ag-ssh-btn-primary" id="ag-remote-confirm-btn">✅ 添加当前目录到项目侧栏</button>',
-      '    </div>',
-      '  </div>',
-      '</div>',
-    ].join('');
-
-    document.body.appendChild(modal);
-
-    const pathInput = modal.querySelector('#ag-remote-path-input');
-    const listEl = modal.querySelector('#ag-remote-dir-list');
-    const statusEl = modal.querySelector('#ag-remote-modal-status');
-    const hiddenChk = modal.querySelector('#ag-remote-hidden-chk');
-    const confirmBtn = modal.querySelector('#ag-remote-confirm-btn');
+    const makeEl = (tag, opts = {}, children = []) => {
+      const node = document.createElement(tag);
+      if (opts.id) node.id = opts.id;
+      if (opts.className) node.className = opts.className;
+      if (opts.type) node.type = opts.type;
+      if (opts.text !== undefined) node.textContent = String(opts.text);
+      if (opts.attrs) {
+        for (const [k, v] of Object.entries(opts.attrs)) {
+          node.setAttribute(k, String(v));
+        }
+      }
+      if (opts.style && node.style) {
+        Object.assign(node.style, opts.style);
+      }
+      for (const ch of children) {
+        if (ch !== null && ch !== undefined) node.append(ch);
+      }
+      return node;
+    };
 
     const normalizeDirPath = (p) => {
       let s = String(p || '/').trim();
@@ -1125,102 +1148,193 @@
       return s || '/';
     };
 
-    const loadDirectory = async (targetPath) => {
-      currentPath = normalizeDirPath(targetPath);
-      pathInput.value = currentPath;
-      statusEl.textContent = `正在读取 ${hostName}:${currentPath} …`;
-      listEl.innerHTML = '<div class="ag-remote-list-empty">正在读取远程目录…</div>';
+    const closeBtn = makeEl('button', {
+      id: 'ag-remote-modal-close',
+      className: 'ag-remote-modal-close',
+      type: 'button',
+      text: '✕',
+      attrs: {title: '关闭'},
+    });
+    const hdr = makeEl('div', {className: 'ag-remote-modal-hdr'}, [
+      makeEl('div', {className: 'ag-remote-modal-title-row'}, [
+        makeEl('span', {className: 'ag-remote-modal-badge', text: `SSH · ${hostName}`}),
+        makeEl('span', {className: 'ag-remote-modal-title', text: '选择远程服务器目录添加到侧边栏'}),
+      ]),
+      closeBtn,
+    ]);
 
-      try {
-        const uriNoSlash = currentPath === '/' ? 'file:///' : `file://${currentPath}`;
-        const res = await callRemoteRpcJson('ReadDir', {uri: uriNoSlash});
-        const entries = Array.isArray(res?.entries) ? res.entries : [];
-        const dirs = [];
-        for (const e of entries) {
-          const isDirectory =
-            e?.isDir === true ||
-            e?.fileType === 'FILE_TYPE_DIRECTORY' ||
-            e?.fileType === 2;
-          if (!isDirectory) continue;
-          const rawPath = e?.uri
-            ? decodeURIComponent(String(e.uri).replace(/^file:\/\//, ''))
-            : '';
-          const name =
-            e?.name ||
-            (rawPath ? rawPath.replace(/\/+$/, '').split('/').pop() : '');
-          if (!name || name === '.' || name === '..') continue;
-          if (!showHidden && name.startsWith('.')) continue;
-          const childPath =
-            rawPath || (currentPath === '/' ? `/${name}` : `${currentPath}/${name}`);
-          dirs.push({name, childPath});
-        }
-        dirs.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    const quickPaths = [...new Set([homeDir, '/develop', '/data', '/tmp', '/'])];
+    const quickBar = makeEl('div', {className: 'ag-remote-modal-Quick'}, [
+      makeEl('span', {className: 'ag-remote-quick-lbl', text: '常用路径:'}),
+      ...quickPaths.map(p => makeEl('button', {
+        className: 'ag-remote-quick-chip',
+        type: 'button',
+        text: p,
+        attrs: {'data-path': p},
+      })),
+    ]);
 
-        listEl.innerHTML = '';
-        if (dirs.length === 0) {
-          listEl.innerHTML = '<div class="ag-remote-list-empty">当前目录下无子文件夹（可直接点击下方按钮添加此目录）</div>';
-        } else {
-          for (const d of dirs) {
-            const row = document.createElement('button');
-            row.type = 'button';
-            row.className = 'ag-remote-dir-row ag-remote-modal-item';
-            row.innerHTML = [
-              '<span class="ag-remote-dir-icon">📁</span>',
-              `<span class="ag-remote-dir-name">${d.name}</span>`,
-              `<span class="ag-remote-dir-sub">${d.childPath}</span>`,
-            ].join('');
-            row.addEventListener('click', () => loadDirectory(d.childPath));
-            listEl.appendChild(row);
-          }
+    const upBtn = makeEl('button', {
+      id: 'ag-remote-up-btn',
+      className: 'ag-ssh-btn ag-ssh-btn-secondary',
+      type: 'button',
+      text: '⬆️ 上级',
+      attrs: {title: '返回上级目录'},
+    });
+    const pathInput = makeEl('input', {
+      id: 'ag-remote-path-input',
+      className: 'ag-remote-path-input',
+      type: 'text',
+      attrs: {spellcheck: 'false'},
+    });
+    const goBtn = makeEl('button', {
+      id: 'ag-remote-go-btn',
+      className: 'ag-ssh-btn ag-ssh-btn-secondary',
+      type: 'button',
+      text: '跳转',
+    });
+    const hiddenChk = makeEl('input', {
+      id: 'ag-remote-hidden-chk',
+      type: 'checkbox',
+    });
+    const hiddenLbl = makeEl('label', {className: 'ag-remote-hidden-lbl'}, [
+      hiddenChk,
+      '显示隐藏项',
+    ]);
+    const pathBar = makeEl('div', {className: 'ag-remote-modal-pathbar'}, [
+      upBtn,
+      pathInput,
+      goBtn,
+      hiddenLbl,
+    ]);
+
+    const breadcrumbsEl = makeEl('div', {
+      id: 'ag-remote-breadcrumbs',
+      className: 'ag-remote-modal-Quick',
+      style: {padding: '6px 16px', gap: '4px'},
+    });
+
+    const filterInput = makeEl('input', {
+      id: 'ag-remote-filter-input',
+      className: 'ag-remote-path-input',
+      type: 'text',
+      attrs: {placeholder: '过滤当前层目录…', spellcheck: 'false'},
+    });
+    const filterBar = makeEl('div', {
+      className: 'ag-remote-modal-pathbar',
+      style: {padding: '6px 16px'},
+    }, [filterInput]);
+
+    const listEl = makeEl('div', {
+      id: 'ag-remote-dir-list',
+      className: 'ag-remote-modal-list',
+    });
+    const statusEl = makeEl('span', {
+      id: 'ag-remote-modal-status',
+      className: 'ag-remote-modal-status',
+    });
+    const cancelBtn = makeEl('button', {
+      id: 'ag-remote-cancel-btn',
+      className: 'ag-ssh-btn ag-ssh-btn-secondary',
+      type: 'button',
+      text: '取消',
+    });
+    const confirmBtn = makeEl('button', {
+      id: 'ag-remote-confirm-btn',
+      className: 'ag-ssh-btn ag-ssh-btn-primary',
+      type: 'button',
+      text: '✅ 添加当前目录到项目侧栏',
+    });
+    const ftr = makeEl('div', {className: 'ag-remote-modal-ftr'}, [
+      statusEl,
+      makeEl('div', {className: 'ag-remote-modal-ftr-btns'}, [cancelBtn, confirmBtn]),
+    ]);
+
+    const dialog = makeEl('div', {
+      className: 'ag-remote-modal-dialog',
+      attrs: {role: 'dialog', 'aria-label': '打开远程 SSH 目录'},
+    }, [hdr, quickBar, pathBar, breadcrumbsEl, filterBar, listEl, ftr]);
+
+    modal = makeEl('div', {
+      id: 'ag-remote-folder-modal',
+      className: 'ag-remote-modal-backdrop',
+    }, [dialog]);
+
+    document.body.appendChild(modal);
+
+    let loadedDirsCount = 0;
+    let emptyFilterHint = null;
+
+    const applyFilter = () => {
+      const q = String(filterInput.value || '').trim().toLowerCase();
+      const rows = listEl.querySelectorAll('.ag-remote-modal-item');
+      let visibleCount = 0;
+      for (const row of rows) {
+        const nameLow = String(row.getAttribute('data-name') || '').toLowerCase();
+        const pathLow = String(row.getAttribute('data-path') || '').toLowerCase();
+        const matched = !q || nameLow.includes(q) || pathLow.includes(q);
+        row.style.display = matched ? '' : 'none';
+        if (matched) visibleCount++;
+      }
+      if (loadedDirsCount > 0 && visibleCount === 0) {
+        if (!emptyFilterHint) {
+          emptyFilterHint = makeEl('div', {
+            className: 'ag-remote-list-empty',
+            text: '没有匹配的目录项',
+          });
+          listEl.appendChild(emptyFilterHint);
         }
-        statusEl.textContent = `已加载 ${dirs.length} 个子目录 · 当前选中: ${currentPath}`;
-      } catch (err) {
-        listEl.innerHTML = `<div class="ag-remote-list-empty">读取失败: ${err.message}</div>`;
-        statusEl.textContent = '请检查目录权限或路径是否存在';
+      } else if (emptyFilterHint) {
+        emptyFilterHint.remove();
+        emptyFilterHint = null;
+      }
+      if (loadedDirsCount > 0) {
+        statusEl.textContent = q
+          ? `已筛选 ${visibleCount}/${loadedDirsCount} 个子目录 · 当前选中: ${currentPath}`
+          : `已加载 ${loadedDirsCount} 个子目录 · 当前选中: ${currentPath}`;
       }
     };
 
-    modal.querySelector('#ag-remote-modal-close').addEventListener('click', () => modal.remove());
-    modal.querySelector('#ag-remote-cancel-btn').addEventListener('click', () => modal.remove());
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) modal.remove();
-    });
-
-    modal.querySelector('#ag-remote-up-btn').addEventListener('click', () => {
-      if (currentPath === '/') return;
-      const idx = currentPath.lastIndexOf('/');
-      const parent = idx <= 0 ? '/' : currentPath.slice(0, idx);
-      loadDirectory(parent);
-    });
-
-    modal.querySelector('#ag-remote-go-btn').addEventListener('click', () => {
-      loadDirectory(pathInput.value);
-    });
-
-    pathInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        loadDirectory(pathInput.value);
-      } else if (e.key === 'Escape') {
-        modal.remove();
-      }
-    });
-
-    hiddenChk.addEventListener('change', () => {
-      showHidden = hiddenChk.checked;
-      loadDirectory(currentPath);
-    });
-
-    for (const chip of modal.querySelectorAll('.ag-remote-quick-chip')) {
-      chip.addEventListener('click', () => {
-        loadDirectory(chip.getAttribute('data-path') || homeDir);
+    const renderBreadcrumbs = (dirPath) => {
+      breadcrumbsEl.textContent = '';
+      const segs = normalizeDirPath(dirPath).split('/').filter(Boolean);
+      const rootBtn = makeEl('button', {
+        className: 'ag-remote-quick-chip',
+        type: 'button',
+        text: '/',
+        attrs: {'data-path': '/'},
       });
-    }
+      rootBtn.addEventListener('click', () => loadDirectory('/'));
+      breadcrumbsEl.appendChild(rootBtn);
+      let acc = '';
+      for (const seg of segs) {
+        acc += '/' + seg;
+        const targetSegPath = acc;
+        breadcrumbsEl.appendChild(makeEl('span', {
+          className: 'ag-remote-quick-lbl',
+          text: '›',
+          style: {margin: '0 1px'},
+        }));
+        const segBtn = makeEl('button', {
+          className: 'ag-remote-quick-chip',
+          type: 'button',
+          text: seg,
+          attrs: {'data-path': targetSegPath},
+        });
+        segBtn.addEventListener('click', () => loadDirectory(targetSegPath));
+        breadcrumbsEl.appendChild(segBtn);
+      }
+    };
 
-    confirmBtn.addEventListener('click', async () => {
-      const targetDir = normalizeDirPath(pathInput.value || currentPath);
-      confirmBtn.disabled = true;
-      confirmBtn.textContent = '正在添加远程项目…';
+    const addRemoteProject = async (rawTargetDir, triggerBtn) => {
+      const targetDir = normalizeDirPath(rawTargetDir || currentPath);
+      const isMainConfirm = triggerBtn === confirmBtn;
+      const origLabel = triggerBtn ? triggerBtn.textContent : '';
+      if (triggerBtn) {
+        triggerBtn.disabled = true;
+        triggerBtn.textContent = isMainConfirm ? '正在添加远程项目…' : '添加中…';
+      }
+      if (!isMainConfirm) confirmBtn.disabled = true;
       statusEl.textContent = `正在向 ${hostName} 注册项目 ${targetDir} …`;
       try {
         const folderUri = `file://${targetDir}`;
@@ -1292,10 +1406,159 @@
         }
         setTimeout(() => decorateSidebarProjects(), 250);
       } catch (err) {
+        if (triggerBtn) {
+          triggerBtn.disabled = false;
+          triggerBtn.textContent = origLabel;
+        }
         confirmBtn.disabled = false;
-        confirmBtn.textContent = '✅ 添加当前目录到项目侧栏';
-        statusEl.textContent = `创建项目失败: ${err.message}`;
+        statusEl.textContent = `创建项目失败: ${err?.message || String(err)}`;
       }
+    };
+
+    const loadDirectory = async (targetPath) => {
+      currentPath = normalizeDirPath(targetPath);
+      pathInput.value = currentPath;
+      filterInput.value = '';
+      loadedDirsCount = 0;
+      emptyFilterHint = null;
+      renderBreadcrumbs(currentPath);
+      statusEl.textContent = `正在读取 ${hostName}:${currentPath} …`;
+      listEl.textContent = '';
+      listEl.appendChild(makeEl('div', {
+        className: 'ag-remote-list-empty',
+        text: '正在读取远程目录…',
+      }));
+
+      try {
+        const uriNoSlash = currentPath === '/' ? 'file:///' : `file://${currentPath}`;
+        const res = await callRemoteRpcJson('ReadDir', {uri: uriNoSlash});
+        const entries = Array.isArray(res?.entries) ? res.entries : [];
+        const dirs = [];
+        for (const e of entries) {
+          const isDirectory =
+            e?.isDir === true ||
+            e?.fileType === 'FILE_TYPE_DIRECTORY' ||
+            e?.fileType === 2;
+          if (!isDirectory) continue;
+          const rawPath = e?.uri
+            ? decodeURIComponent(String(e.uri).replace(/^file:\/\//, ''))
+            : '';
+          const name =
+            e?.name ||
+            (rawPath ? rawPath.replace(/\/+$/, '').split('/').pop() : '');
+          if (!name || name === '.' || name === '..') continue;
+          if (!showHidden && name.startsWith('.')) continue;
+          const childPath =
+            rawPath || (currentPath === '/' ? `/${name}` : `${currentPath}/${name}`);
+          dirs.push({name, childPath});
+        }
+        dirs.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+        loadedDirsCount = dirs.length;
+
+        listEl.textContent = '';
+        if (dirs.length === 0) {
+          listEl.appendChild(makeEl('div', {
+            className: 'ag-remote-list-empty',
+            text: '当前目录下无子文件夹（可直接点击下方按钮添加此目录）',
+          }));
+        } else {
+          for (const d of dirs) {
+            const enterBtn = makeEl('button', {
+              className: 'ag-remote-dir-enter',
+              type: 'button',
+              style: {
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                flex: '1',
+                minWidth: '0',
+                border: 'none',
+                background: 'transparent',
+                color: 'inherit',
+                textAlign: 'left',
+                cursor: 'pointer',
+                padding: '0',
+                font: 'inherit',
+              },
+            }, [
+              makeEl('span', {className: 'ag-remote-dir-icon', text: '📁'}),
+              makeEl('span', {className: 'ag-remote-dir-name', text: d.name}),
+              makeEl('span', {className: 'ag-remote-dir-sub', text: d.childPath}),
+            ]);
+            const pickBtn = makeEl('button', {
+              className: 'ag-ssh-btn ag-ssh-btn-secondary ag-remote-pick-btn',
+              type: 'button',
+              text: '选择此项',
+              style: {flexShrink: '0', padding: '2px 8px', fontSize: '11.5px'},
+            });
+            const row = makeEl('div', {
+              className: 'ag-remote-dir-row ag-remote-modal-item',
+              attrs: {'data-name': d.name, 'data-path': d.childPath},
+            }, [enterBtn, pickBtn]);
+            pickBtn.addEventListener('click', (ev) => {
+              ev.stopPropagation();
+              addRemoteProject(d.childPath, pickBtn);
+            });
+            row.addEventListener('click', (ev) => {
+              if (ev.target === pickBtn || ev.target?.closest?.('.ag-remote-pick-btn')) return;
+              loadDirectory(d.childPath);
+            });
+            listEl.appendChild(row);
+          }
+        }
+        statusEl.textContent = `已加载 ${dirs.length} 个子目录 · 当前选中: ${currentPath}`;
+      } catch (err) {
+        loadedDirsCount = 0;
+        listEl.textContent = '';
+        listEl.appendChild(makeEl('div', {
+          className: 'ag-remote-list-empty',
+          text: `读取失败: ${err?.message || String(err)}`,
+        }));
+        statusEl.textContent = '请检查目录权限或路径是否存在';
+      }
+    };
+
+    closeBtn.addEventListener('click', () => modal.remove());
+    cancelBtn.addEventListener('click', () => modal.remove());
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) modal.remove();
+    });
+
+    upBtn.addEventListener('click', () => {
+      if (currentPath === '/') return;
+      const idx = currentPath.lastIndexOf('/');
+      const parent = idx <= 0 ? '/' : currentPath.slice(0, idx);
+      loadDirectory(parent);
+    });
+
+    goBtn.addEventListener('click', () => {
+      loadDirectory(pathInput.value);
+    });
+
+    pathInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        loadDirectory(pathInput.value);
+      } else if (e.key === 'Escape') {
+        modal.remove();
+      }
+    });
+
+    filterInput.addEventListener('input', applyFilter);
+
+    hiddenChk.addEventListener('change', () => {
+      showHidden = hiddenChk.checked;
+      loadDirectory(currentPath);
+    });
+
+    for (const chip of quickBar.querySelectorAll('.ag-remote-quick-chip')) {
+      chip.addEventListener('click', () => {
+        loadDirectory(chip.getAttribute('data-path') || homeDir);
+      });
+    }
+
+    confirmBtn.addEventListener('click', () => {
+      addRemoteProject(pathInput.value || currentPath, confirmBtn);
     });
 
     loadDirectory(currentPath);
@@ -2307,6 +2570,8 @@
     sync,
     setState,
     translateRoot,
+    isEphemeralSummary,
+    computeTextTranslation,
     ensureMetricsPill,
     renderSshSidebarCard,
     decorateSidebarProjects,
@@ -2319,6 +2584,10 @@
       clearTimeout(timer);
       observer?.disconnect();
       metricsResizeObserver?.disconnect();
+      if (window.__agHealProjectsTimer) {
+        clearInterval(window.__agHealProjectsTimer);
+        delete window.__agHealProjectsTimer;
+      }
       if (window.__ag_metrics_route_watcher) {
         clearInterval(window.__ag_metrics_route_watcher);
         delete window.__ag_metrics_route_watcher;

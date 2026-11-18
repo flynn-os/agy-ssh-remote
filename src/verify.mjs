@@ -249,13 +249,39 @@ try {
   })()`);
 
   // Verify SSH tunnel, federated project APIs & smart per-request RPC routing on 58282
-  const bridgeStatusRes = await fetch('http://127.0.0.1:58284/status', {signal: AbortSignal.timeout(4000)}).then(r => r.json()).catch(() => null);
+  let gatewayToken = '';
+  let bridgeToken = '';
+  try {
+    const rawTokens = await fs.readFile(path.join(patchDir, 'cache/runtime-tokens.json'), 'utf8');
+    const parsedTokens = JSON.parse(rawTokens);
+    if (parsedTokens && typeof parsedTokens === 'object') {
+      gatewayToken = typeof parsedTokens.gatewayToken === 'string' ? parsedTokens.gatewayToken : '';
+      bridgeToken = typeof parsedTokens.bridgeToken === 'string' ? parsedTokens.bridgeToken : '';
+    }
+  } catch {}
+  const bridgeHeaders = bridgeToken ? {'x-ag-bridge-token': bridgeToken} : {};
+
+  const [bridgeStatusRes, bridgeUnauthRes, gatewayUnauthRes] = await Promise.all([
+    fetch('http://127.0.0.1:58284/status', {headers: bridgeHeaders, signal: AbortSignal.timeout(4000)}).then(r => r.json()).catch(() => null),
+    fetch('http://127.0.0.1:58284/status', {signal: AbortSignal.timeout(4000)}).catch(() => null),
+    httpsRequest(58282, '/exa.language_server_pb.LanguageServerService/ListProjects', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Connect-Protocol-Version': '1',
+      },
+      body: '{}',
+    }).catch(() => ({statusCode: 0})),
+  ]);
+  const bridgeAuthEnforcedOk = bridgeUnauthRes?.status === 401;
+  const gatewayAuthEnforcedOk = gatewayUnauthRes?.statusCode === 401;
+
   const liveSshState = domResult.sshUi?.sshState || {};
   const sampleLocalCid = (liveSshState.localCascadeIds || [])[0] || '00000000-0000-4000-8000-000000000010';
   const sampleRemoteCid = (liveSshState.remoteCascadeIds || [])[0] || '00000000-0000-4000-8000-000000000020';
   const remoteHomeDir = bridgeStatusRes?.homeDir || liveSshState.remoteHomeDir || '/tmp';
   const localHomeDir = os.homedir();
-  const bridgeMetricsRes = await fetch(`http://127.0.0.1:58284/metrics?cascadeId=${encodeURIComponent(sampleLocalCid)}`, {signal: AbortSignal.timeout(4000)}).then(r => r.json()).catch(() => null);
+  const bridgeMetricsRes = await fetch(`http://127.0.0.1:58284/metrics?cascadeId=${encodeURIComponent(sampleLocalCid)}`, {headers: bridgeHeaders, signal: AbortSignal.timeout(4000)}).then(r => r.json()).catch(() => null);
   const indexRes = await httpsRequest(58282, '/').catch(() => ({statusCode: 0, body: ''}));
   const mainJsText = await fs.readFile(path.join(patchDir, 'cache/www/main.js'), 'utf8').catch(() => '');
   const csrfToken = bridgeStatusRes?.csrfToken || liveSshState.csrfToken || '';
@@ -263,6 +289,7 @@ try {
     'Content-Type': 'application/json',
     'Connect-Protocol-Version': '1',
     ...(csrfToken ? {'x-codeium-csrf-token': csrfToken} : {}),
+    ...(gatewayToken ? {'x-ag-gateway-token': gatewayToken} : {}),
   };
   const syntheticLocalCid = '00000000-0000-4000-8000-000000000001';
   const [authRes, remoteReadDirRes, localReadDirRes, federatedListProjRes, remoteTrajectoryRes, localTrajectoryRes, pluralAnnotationsRes] = await Promise.all([
@@ -460,7 +487,7 @@ try {
 
   // Verify CLI-spawned session indexing & trajectory loading dynamically
   const [cliBridgeRes, allTrajRes] = await Promise.all([
-    fetch('http://127.0.0.1:58284/cli-summaries', {signal: AbortSignal.timeout(4000)}).then(r => r.json()).catch(() => null),
+    fetch('http://127.0.0.1:58284/cli-summaries', {headers: bridgeHeaders, signal: AbortSignal.timeout(4000)}).then(r => r.json()).catch(() => null),
     httpsRequest(58282, '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories', {
       method: 'POST',
       headers: rpcHeaders,
@@ -501,6 +528,8 @@ try {
     sshTunnel: {
       bridgeRunning: !!bridgeStatusRes?.ok && !!bridgeStatusRes?.running,
       bridgeMetricsOk: bridgeMetricsRes?.ok === true,
+      bridgeAuthEnforcedOk,
+      gatewayAuthEnforcedOk,
       remoteHostname: bridgeStatusRes?.hostname,
       remotePid: bridgeStatusRes?.pid,
       indexStatusCode: indexRes.statusCode,
@@ -533,7 +562,7 @@ try {
     },
   };
 
-  result.passed = result.version === '20261110-ssh-v13'
+  result.passed = result.version === '20261118-ssh-v14'
     && result.chuanbanV5?.waxSealAttr
     && result.chuanbanV5?.osAttr
     && result.chuanbanV5?.pageTypeAttr
@@ -579,6 +608,8 @@ try {
     && result.sshUi.extensionsShimAvailable
     && result.sshTunnel.bridgeRunning
     && result.sshTunnel.bridgeMetricsOk
+    && result.sshTunnel.bridgeAuthEnforcedOk
+    && result.sshTunnel.gatewayAuthEnforcedOk
     && result.sshTunnel.indexStatusCode === 200
     && result.sshTunnel.indexHasSshRemoteFlag
     && result.sshTunnel.mainJsIsolatesNativeStorage
